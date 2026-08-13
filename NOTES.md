@@ -82,3 +82,10 @@ Next steps: M4 full -ngl 99 on 1x2 mesh pending resolution of shape handling
 ## M4 full -ngl 99
 - Still aborts in reshape_tt_tensor_into_ggml for sharded tensors
 - Blocked by reshape/view handling for distributed tensors
+
+
+## 2026-08-13 correctness gate attempt
+- llama-cli TT path enters chat mode and fails peg-native format for longer prompts
+- Short prompts like "Paris" work, longer prompts like "The capital of France is " fail with Error: model produced output that does not match expected peg-native format
+- Unable to capture token-for-token output with current CLI flags
+- Shape asserts are re-enabled for real
