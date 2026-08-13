@@ -3074,7 +3074,7 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
     }
     else {
         t = realize_ggml_view(tensor);
-        // GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, *t));
+        GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, *t));
     }
     if(t->dtype() != tt::tt_metal::DataType::BFLOAT16 && t->dtype() != tt::tt_metal::DataType::FLOAT32 && t->dtype() != tt::tt_metal::DataType::UINT32) {
         t = std::make_shared<tt::tt_metal::Tensor>(ttnn::typecast(*t, tt::tt_metal::DataType::BFLOAT16));
