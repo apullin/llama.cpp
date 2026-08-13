@@ -941,8 +941,16 @@ std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor* tenso
         return std::make_shared<tt::tt_metal::Tensor>(ggml_metalium_row_unfold(*meta->row_folded));
     }
     auto res = realize_ggml_view_impl(tensor);
-    // Shape check disabled for sharded tensors (M3)
-    // if(!ggml_tt_tensors_shape_equal(tensor, *res)) { ... }
+    // Sharded (M3) tensors legitimately report a per-device shard shape that differs
+    // from the GGML view shape; only enforce the check for replicated/host tensors.
+    bool distributed = meta != nullptr && meta->m3_sharded;
+    if(!distributed && !ggml_tt_tensors_shape_equal(tensor, *res)) {
+        std::cout << "FATAL ERROR: Shape mismatch between TTNN and GGML after view op " << ggml_op_name(tensor->op)
+            << " tensor '" << tensor->name << "' storage=" << (int)res->storage_type() << "\n"
+            << "  Result: " << res->logical_shape() << "\n"
+            << "  GGML expecting: " << tensor->ne[3] << " " << tensor->ne[2] << " " << tensor->ne[1] << " " << tensor->ne[0] << "\n";
+        GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, *res));
+    }
     return res;
 }
 
@@ -1242,11 +1250,29 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
             /* program_config         = */ std::nullopt,
             /* activation             = */ std::nullopt,
             /* compute_kernel_config  = */ make_compute_kernel_config(a.device()));
-        // If weight was sharded, gather output to all devices
-        if (a.storage_type() == tt::tt_metal::StorageType::DEVICE &&
-            a.device_storage().get_mesh_buffer().global_layout() != tt::tt_metal::distributed::MeshBufferLayout::REPLICATED) {
-            // all_gather along last dim (-1) for column-parallel
-            out = ttnn::all_gather(out, -1, 0);
+        // If the weight was sharded across the mesh at upload (M3), the matmul output
+        // is a per-device partial along the output dim; gather it back to full width.
+        // (Mesh-buffer introspection cannot detect this on the pinned tt-metal build —
+        // sharded tensors report REPLICATED there — so use our own upload-time flag.)
+        auto src0_meta = static_cast<ggml_tensor_extra_metalium*>(src0->extra);
+        static const bool m3_no_gather = getenv("GGML_METALIUM_M3_NO_GATHER") != nullptr;
+        static const bool m3_ccl = getenv("GGML_METALIUM_M3_CCL") != nullptr;
+        if (src0_meta != nullptr && src0_meta->m3_sharded && !m3_no_gather) {
+            if (m3_ccl) {
+                // CCL all_gather over the inter-chip fabric. NOTE: wedges the command
+                // queue on our N300 (single inter-chip link, pinned tt-metal 13adda80)
+                // even with a 1-channel mesh graph descriptor and Linear/NeighborExchange
+                // topology — matmul itself syncs fine, the CCL kernel never completes.
+                // Kept behind an env until the fabric stack is sorted.
+                out = ttnn::all_gather(out, -1, 0);
+            } else {
+                // Host-roundtrip gather: read each device's partial output, concat on
+                // host, re-upload replicated. Costs a sync + PCIe roundtrip per sharded
+                // matmul, but needs no working fabric.
+                auto* mesh = static_cast<ttnn::MeshDevice*>(a.device());
+                auto composer = ttnn::distributed::concat_mesh_to_tensor_composer(*mesh, 3);
+                out = ttnn::distributed::aggregate_tensor(out, *composer).to_device(mesh);
+            }
         }
         ggml_metalium_store_tensor(dst_meta, std::move(out));
     }
@@ -2949,14 +2975,31 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
         , intermidiate_type, tt::tt_metal::Layout::ROW_MAJOR);
 
     tt::tt_metal::DataType final_type = ggml2tt_type(ggtype, bufctx->device->arch());
-    // Sharding policy for M3
+    // Sharding policy for M3: column-parallel shard (along GGML ne1) of weights that
+    // are consumed exclusively by MUL_MAT — the matmul handler all_gathers the partial
+    // outputs back. Weights consumed by other ops (e.g. token_embd by the embedding
+    // kernel, which needs the full vocab per device) must stay replicated.
+    static const char* shard_whitelist[] = {
+        ".attn_q.weight", ".attn_k.weight", ".attn_v.weight", ".attn_gate.weight",
+        ".attn_output.weight", ".ffn_up.weight", ".ffn_gate.weight", ".ffn_down.weight",
+        "output.weight",
+    };
     bool should_shard = false;
     int shard_dim = -1;
+    static const bool m3_no_shard = getenv("GGML_METALIUM_M3_NO_SHARD") != nullptr;
     size_t num_devices = bufctx->device->get_devices().size();
-    if (num_devices > 1) {
+    if (num_devices > 1 && !m3_no_shard) {
         size_t tensor_bytes = ggml_nbytes(tensor);
         const size_t min_shard_bytes = 1024 * 1024; // 1 MiB
-        if (tensor_bytes >= min_shard_bytes) {
+        bool name_ok = false;
+        for (const char* suffix : shard_whitelist) {
+            std::string_view name(tensor->name);
+            if (name.size() >= strlen(suffix) && name.substr(name.size() - strlen(suffix)) == suffix) {
+                name_ok = true;
+                break;
+            }
+        }
+        if (name_ok && tensor_bytes >= min_shard_bytes) {
             int non_one_dims = 0;
             for (int i = 0; i < GGML_MAX_DIMS; i++) {
                 if (tensor->ne[i] != 1) non_one_dims++;
@@ -2971,10 +3014,12 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
 
     auto to_device_tensor = [&]() -> tt::tt_metal::Tensor {
         if (should_shard) {
+            fmt::println(stderr, "M3 shard upload: '{}' ne=[{},{},{},{}]",
+                tensor->name, tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
             auto mapper = ttnn::distributed::shard_tensor_to_mesh_mapper(*bufctx->device, shard_dim);
-            auto dist_t = ttnn::distributed::distribute_tensor(t, *mapper, std::ref(*bufctx->device));
-            // distribute_tensor returns a device tensor; we need to keep it as is for tilize
-            return dist_t;
+            auto dist = ttnn::distributed::distribute_tensor(t, *mapper, std::ref(*bufctx->device));
+            fmt::println(stderr, "M3 distribute done: '{}'", tensor->name);
+            return dist;
         } else {
             return t.to_device(bufctx->device.get());
         }
@@ -2984,6 +3029,7 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
         auto dev_t = to_device_tensor();
         t = ttnn::tilize_with_zero_padding(dev_t, std::nullopt, final_type);
         if(permute.has_value()) {
+            if (should_shard) fmt::println(stderr, "M3 permute after tilize: '{}'", tensor->name);
             t = ttnn::permute(t, *permute);
         }
     }
@@ -3001,6 +3047,8 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     }
     GGML_ASSERT(t.layout() == (tilize ? tt::tt_metal::Layout::TILE : tt::tt_metal::Layout::ROW_MAJOR));
     ggml_metalium_store_tensor(meta, std::move(t));
+    meta->m3_sharded = should_shard;
+    if (should_shard) fmt::println(stderr, "M3 upload complete: '{}'", tensor->name);
 }
 
 static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer,
@@ -4343,8 +4391,7 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
                 GGML_ASSERT(false && "Metalium output memory_config contract broken");
             }
             if(!ggml_tt_tensors_shape_equal(node, *meta->tensor)) {
-                fmt::println(stderr, "Mismatched tensor shapes for node '%s' ({}): GGML wants [{}, {}, {}, {}], TTNN generates {}
-"
+                fmt::println(stderr, "Mismatched tensor shapes for node '{}' ({}): GGML wants [{}, {}, {}, {}], TTNN generates {}\n"
                     , node->name, ggml_op_name(node->op), node->ne[0], node->ne[1], node->ne[2], node->ne[3], meta->tensor->logical_shape());
                 abort();
             }
