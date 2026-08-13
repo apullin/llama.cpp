@@ -58,6 +58,11 @@ void ggml_metalium_store_tensor(ggml_tensor_extra_metalium* meta, std::shared_pt
 // sanity check passes and consumers see the node's canonical shape.
 tt::tt_metal::Tensor reshape_tt_tensor_into_ggml(const tt::tt_metal::Tensor& tensor, const struct ggml_tensor * node);
 
+// M3 dual-ASIC: if the weight backing a matmul/linear was sharded across the mesh at
+// upload, gather the per-device partial outputs back to full width (host roundtrip;
+// see ggml-metalium.cpp for why this is not a CCL all_gather). Otherwise a no-op.
+tt::tt_metal::Tensor ggml_metalium_m3_gather(tt::tt_metal::Tensor out, const ggml_tensor * weight);
+
 // Stable identity for a cgraph: its uid when set, else a topology+shape signature. The graph
 // compiler caches its per-graph fusion plan on this key (the same key the trace layer uses).
 uint64_t metalium_graph_key(const ggml_cgraph* cgraph);

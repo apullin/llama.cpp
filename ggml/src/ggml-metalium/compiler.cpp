@@ -2173,6 +2173,7 @@ bool LinearLowering::apply(ggml_backend_metalium_context * ctx, const Site & sit
         /* activation             = */ std::nullopt,
         /* compute_kernel_config  = */ make_compute_kernel_config(b->device()));
 
+    out = ggml_metalium_m3_gather(std::move(out), site.weight);
     ggml_metalium_store_tensor(meta, std::move(out));
     return true;
 }
@@ -2834,6 +2835,7 @@ bool ActLowering::apply(ggml_backend_metalium_context * ctx, const Site & site) 
             make_compute_kernel_config(b->device()));
     }
 
+    out = ggml_metalium_m3_gather(std::move(out), site.weight);
     ggml_metalium_store_tensor(meta, std::move(out));
     return true;
 }
