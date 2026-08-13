@@ -1243,8 +1243,8 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
             /* activation             = */ std::nullopt,
             /* compute_kernel_config  = */ make_compute_kernel_config(a.device()));
         // If weight was sharded, gather output to all devices
-        if (b.storage_type() == tt::tt_metal::StorageType::DEVICE &&
-            b.device_storage().get_mesh_buffer().global_layout() != tt::tt_metal::distributed::MeshBufferLayout::REPLICATED) {
+        if (a.storage_type() == tt::tt_metal::StorageType::DEVICE &&
+            a.device_storage().get_mesh_buffer().global_layout() != tt::tt_metal::distributed::MeshBufferLayout::REPLICATED) {
             // all_gather along last dim (-1) for column-parallel
             out = ttnn::all_gather(out, -1, 0);
         }
@@ -3074,7 +3074,6 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
     }
     else {
         t = realize_ggml_view(tensor);
-        // Shape check disabled for mesh debugging
         // GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, *t));
     }
     if(t->dtype() != tt::tt_metal::DataType::BFLOAT16 && t->dtype() != tt::tt_metal::DataType::FLOAT32 && t->dtype() != tt::tt_metal::DataType::UINT32) {
@@ -4344,10 +4343,10 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
                 GGML_ASSERT(false && "Metalium output memory_config contract broken");
             }
             if(!ggml_tt_tensors_shape_equal(node, *meta->tensor)) {
-                // Skip shape check for mesh to unblock M3/M4 verification
-                // fmt::println(stderr, "Mismatched tensor shapes for node '{}' ({}): GGML wants [{}, {}, {}, {}], TTNN generates {}\n"
-                //     , node->name, ggml_op_name(node->op), node->ne[0], node->ne[1], node->ne[2], node->ne[3], meta->tensor->logical_shape());
-                // abort();
+                fmt::println(stderr, "Mismatched tensor shapes for node '%s' ({}): GGML wants [{}, {}, {}, {}], TTNN generates {}
+"
+                    , node->name, ggml_op_name(node->op), node->ne[0], node->ne[1], node->ne[2], node->ne[3], meta->tensor->logical_shape());
+                abort();
             }
         }
 
