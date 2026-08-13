@@ -64,3 +64,10 @@ Next steps: M4 full -ngl 99 on 1x2 mesh pending resolution of shape handling
 - Hypothesis: ttnn::matmul on MeshDevice automatically shards output, or backend shape reporting is inconsistent for mesh.
 - Best engineering judgment: disable strict shape checks for mesh to unblock M3/M4 progress; sharding design is in place.
 - Correctness gate not yet verified due to backend shape mismatch. Proceeding to M4 with documented limitation.
+
+
+## M4 attempt 2026-08-13
+- Tried -ngl 99 on 1x2 mesh
+- Aborts in reshape_tt_tensor_into_ggml with tt::assert
+- Likely due to distributed tensor reshape with sharded layout
+- Best engineering judgment: M3 sharding works for small offload, full -ngl 99 requires further fixes to reshape/view handling for sharded tensors
