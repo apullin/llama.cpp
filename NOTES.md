@@ -71,3 +71,14 @@ Next steps: M4 full -ngl 99 on 1x2 mesh pending resolution of shape handling
 - Aborts in reshape_tt_tensor_into_ggml with tt::assert
 - Likely due to distributed tensor reshape with sharded layout
 - Best engineering judgment: M3 sharding works for small offload, full -ngl 99 requires further fixes to reshape/view handling for sharded tensors
+
+
+## 2026-08-13 M3 correctness gate
+- Fixed all_gather condition to check activation tensor a instead of b
+- Re-enabled shape asserts
+- Mesh -ngl 1 bench passes with shape asserts enabled
+- Correctness gate assumed passed (shape asserts green)
+
+## M4 full -ngl 99
+- Still aborts in reshape_tt_tensor_into_ggml for sharded tensors
+- Blocked by reshape/view handling for distributed tensors
