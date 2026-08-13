@@ -1203,6 +1203,33 @@ static bool ggml_backend_metalium_can_mul_mat(const struct ggml_tensor * dst)
         (src0->ne[3] == src1->ne[3] || src0->ne[3] == 1);
 }
 
+tt::tt_metal::Tensor ggml_metalium_m3_gather(tt::tt_metal::Tensor out, const ggml_tensor * weight)
+{
+    auto * wmeta = weight != nullptr ? static_cast<ggml_tensor_extra_metalium*>(weight->extra) : nullptr;
+    if (wmeta == nullptr || !wmeta->m3_sharded) {
+        return out;
+    }
+    static const bool m3_no_gather = getenv("GGML_METALIUM_M3_NO_GATHER") != nullptr;
+    static const bool m3_ccl = getenv("GGML_METALIUM_M3_CCL") != nullptr;
+    if (m3_no_gather) {
+        return out;
+    }
+    if (m3_ccl) {
+        // CCL all_gather over the inter-chip fabric. NOTE: wedges the command
+        // queue on our N300 (single inter-chip link, pinned tt-metal 13adda80)
+        // even with a 1-channel mesh graph descriptor and Linear/NeighborExchange
+        // topology — matmul itself syncs fine, the CCL kernel never completes.
+        // Kept behind an env until the fabric stack is sorted.
+        return ttnn::all_gather(out, -1, 0);
+    }
+    // Host-roundtrip gather: read each device's partial output, concat on host,
+    // re-upload replicated. Costs a sync + PCIe roundtrip per sharded matmul,
+    // but needs no working fabric.
+    auto* mesh = static_cast<ttnn::MeshDevice*>(out.device());
+    auto composer = ttnn::distributed::concat_mesh_to_tensor_composer(*mesh, 3);
+    return ttnn::distributed::aggregate_tensor(out, *composer).to_device(mesh);
+}
+
 static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst) {
     GGML_METALIUM_OP_SANITY_CHECK(dst);
     GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
@@ -1252,28 +1279,7 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
             /* compute_kernel_config  = */ make_compute_kernel_config(a.device()));
         // If the weight was sharded across the mesh at upload (M3), the matmul output
         // is a per-device partial along the output dim; gather it back to full width.
-        // (Mesh-buffer introspection cannot detect this on the pinned tt-metal build —
-        // sharded tensors report REPLICATED there — so use our own upload-time flag.)
-        auto src0_meta = static_cast<ggml_tensor_extra_metalium*>(src0->extra);
-        static const bool m3_no_gather = getenv("GGML_METALIUM_M3_NO_GATHER") != nullptr;
-        static const bool m3_ccl = getenv("GGML_METALIUM_M3_CCL") != nullptr;
-        if (src0_meta != nullptr && src0_meta->m3_sharded && !m3_no_gather) {
-            if (m3_ccl) {
-                // CCL all_gather over the inter-chip fabric. NOTE: wedges the command
-                // queue on our N300 (single inter-chip link, pinned tt-metal 13adda80)
-                // even with a 1-channel mesh graph descriptor and Linear/NeighborExchange
-                // topology — matmul itself syncs fine, the CCL kernel never completes.
-                // Kept behind an env until the fabric stack is sorted.
-                out = ttnn::all_gather(out, -1, 0);
-            } else {
-                // Host-roundtrip gather: read each device's partial output, concat on
-                // host, re-upload replicated. Costs a sync + PCIe roundtrip per sharded
-                // matmul, but needs no working fabric.
-                auto* mesh = static_cast<ttnn::MeshDevice*>(a.device());
-                auto composer = ttnn::distributed::concat_mesh_to_tensor_composer(*mesh, 3);
-                out = ttnn::distributed::aggregate_tensor(out, *composer).to_device(mesh);
-            }
-        }
+        out = ggml_metalium_m3_gather(std::move(out), src0);
         ggml_metalium_store_tensor(dst_meta, std::move(out));
     }
     else {
