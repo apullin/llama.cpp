@@ -89,3 +89,33 @@ Next steps: M4 full -ngl 99 on 1x2 mesh pending resolution of shape handling
 - Short prompts like "Paris" work, longer prompts like "The capital of France is " fail with Error: model produced output that does not match expected peg-native format
 - Unable to capture token-for-token output with current CLI flags
 - Shape asserts are re-enabled for real
+
+
+## 2026-08-13 M3/M4 VERIFIED (Kimi takeover)
+
+Gate results (prompt "The capital of France is", temp 0, n 20):
+- CPU -ngl 0 vs single-ASIC -ngl 1: token-identical.
+- Mesh 1x2 -ngl 1: token-identical to both. GATE PASS.
+- Controlled pair -ngl 20: single-ASIC vs mesh 1x2 token-identical
+  ("...The capital of France is\nWe need to answer."). Sharding is
+  numerically transparent.
+- M4 -ngl 99 full offload on mesh: runs, coherent ("...Probably answer:
+  Paris."). ~1.4 t/s decode, dominated by host-roundtrip gathers.
+
+Root causes fixed today:
+1. Blanket sharding caught token_embd (embedding kernel needs full vocab)
+   -> name whitelist: only MUL_MAT-consumed weights shard.
+2. This tt-metal build reports per-device SHARD logical_shape and
+   REPLICATED mesh layout even for mapper-sharded tensors. All the
+   "mesh shape mismatch" aborts were that misread. Sharding is now
+   tracked by an explicit m3_sharded flag on the tensor meta.
+3. Fused lowerings (ActLowering, LinearLowering) emit their own
+   matmul/linear and bypassed the gather -> shared ggml_metalium_m3_gather.
+4. CCL all_gather wedges the command queue on this N300 (single inter-chip
+   link) regardless of mesh graph descriptor / topology setting. Gather is
+   a host roundtrip (aggregate_tensor + concat + re-upload). CCL path
+   remains behind GGML_METALIUM_M3_CCL=1.
+
+Perf: mesh -ngl 20 = 3.3 t/s vs single-ASIC 5.5 t/s (gather tax exceeds
+second-ASIC gain at partial offload). -ngl 99 mesh = 1.4 t/s (only way to
+full-offload; single-ASIC OOMs). 4080 bar: 29 t/s. Fabric CCL is the lever.
