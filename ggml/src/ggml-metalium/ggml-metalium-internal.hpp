@@ -28,6 +28,13 @@ struct ggml_tensor_extra_metalium {
 
     std::optional<tt::tt_metal::MemoryConfig> memory_config;
 
+    // M3 dual-ASIC: true when this tensor was sharded across the mesh at upload
+    // (column-parallel weight shard along GGML ne1). This tt-metal build reports
+    // the per-device shard shape via logical_shape() and MeshBufferLayout::REPLICATED
+    // even for mapper-sharded tensors, so distribution must be tracked here rather
+    // than via mesh-buffer introspection.
+    bool m3_sharded = false;
+
     bool is_row_folded() const { return row_folded != nullptr; }
 };
 
