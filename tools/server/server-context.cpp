@@ -1305,8 +1305,13 @@ private:
 
         int n_ctx_slot = llama_n_ctx_seq(ctx_tgt);
         if (n_ctx_slot > n_ctx_train) {
-            SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n", n_ctx_slot, n_ctx_train);
-            n_ctx_slot = n_ctx_train;
+            if (params_base.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_NONE ||
+                params_base.rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
+                SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - capping\n", n_ctx_slot, n_ctx_train);
+                n_ctx_slot = n_ctx_train;
+            } else {
+                SRV_WRN("the slot context (%d) exceeds the training context of the model (%d) - allowing due to RoPE scaling\n", n_ctx_slot, n_ctx_train);
+            }
         }
 
         slots.clear();
