@@ -119,3 +119,20 @@ Root causes fixed today:
 Perf: mesh -ngl 20 = 3.3 t/s vs single-ASIC 5.5 t/s (gather tax exceeds
 second-ASIC gain at partial offload). -ngl 99 mesh = 1.4 t/s (only way to
 full-offload; single-ASIC OOMs). 4080 bar: 29 t/s. Fabric CCL is the lever.
+
+
+## M5 numbers (2026-08-13, llama-bench -p 64 -n 64 -nkvo 1)
+
+| config | pp t/s | tg t/s |
+|---|---|---|
+| CPU 32t (reference) | 88.7 | 10.6 |
+| RTX 4080 (-ngl 48) | ~276 | ~29 |
+| Metalium single-ASIC (-ngl 20) | 95.8 | 5.33 |
+| Metalium mesh 1x2 -ngl 99 (shard+host-gather) | 16.6 | 1.38 |
+| Metalium dual-ASIC layer-split -ngl 99 (GGML_METALIUM_DEVICE_ID=0,1) | 84.4 | 2.47 |
+
+Layer-split = one 2x1 parent mesh + 1x1 submesh per ASIC, llama.cpp native
+multi-backend layer split. No fabric/CCL. Output token-identical to mesh
+full-offload run. Trace mode: captures but never replays (per-token graph
+keys differ — KV length is baked into graph shapes; replay needs a
+shape-stable padded decode graph).
