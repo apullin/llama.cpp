@@ -4184,6 +4184,48 @@ static void metalium_release_finalize_schedule(MetaliumReleaseScheduler & sched,
     sched.finalized = true;
 }
 
+// Per-op host-time profiler, enabled with GGML_METALIUM_PROF=1. Accumulates wall time
+// per op type across all graph computes; dumps a sorted table at exit.
+struct MetaliumOpProfiler {
+    static bool enabled() {
+        static const bool e = getenv("GGML_METALIUM_PROF") != nullptr;
+        return e;
+    }
+    static std::map<std::string, std::pair<uint64_t, double>> & stats() {
+        static std::map<std::string, std::pair<uint64_t, double>> m;
+        return m;
+    }
+    static void dump_at_exit() {
+        if(!enabled()) return;
+        std::vector<std::pair<std::string, std::pair<uint64_t, double>>> v(stats().begin(), stats().end());
+        std::sort(v.begin(), v.end(), [](auto & a, auto & b) { return a.second.second > b.second.second; });
+        double total = 0;
+        for(auto & p : v) total += p.second.second;
+        fprintf(stderr, "\n==== METALIUM OP PROFILE (host wall time, total %.1f ms) ====\n", total / 1000.0);
+        for(auto & p : v) {
+            fprintf(stderr, "  %-24s n=%-6llu total=%9.1f ms  avg=%8.1f us\n",
+                p.first.c_str(), (unsigned long long)p.second.first, p.second.second / 1000.0, p.second.second / p.second.first);
+        }
+    }
+    const char * key = nullptr;
+    std::chrono::steady_clock::time_point t0;
+    bool on = false;
+    MetaliumOpProfiler(const ggml_tensor * n) {
+        static const bool reg = [](){ std::atexit(dump_at_exit); return true; }();
+        (void)reg;
+        on = enabled();
+        if(on) { key = ggml_op_name(n->op); t0 = std::chrono::steady_clock::now(); }
+    }
+    ~MetaliumOpProfiler() {
+        if(on) {
+            double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+            auto & s = stats()[key];
+            s.first++;
+            s.second += us;
+        }
+    }
+};
+
 static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
     ggml_backend_metalium_context * ctx = (ggml_backend_metalium_context *)backend->context;
 
@@ -4207,6 +4249,7 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
     std::vector<ggml_tensor *> pending_release;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         struct ggml_tensor * node = cgraph->nodes[i];
+        MetaliumOpProfiler op_prof(node);
         if(release_activations && release_sched.finalized) {
             if(const auto it = release_sched.final_release_at.find(node); it != release_sched.final_release_at.end()) {
                 pending_release.insert(pending_release.end(), it->second.begin(), it->second.end());
