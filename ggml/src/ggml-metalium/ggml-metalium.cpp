@@ -3055,6 +3055,10 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     ggml_metalium_store_tensor(meta, std::move(t));
     meta->m3_sharded = should_shard;
     if (should_shard) fmt::println(stderr, "M3 upload complete: '{}'", tensor->name);
+    static const bool m6_debug = getenv("GGML_METALIUM_M6_DEBUG") != nullptr;
+    if (m6_debug && (strstr(tensor->name, "l_out-26") || strstr(tensor->name, "Metalium"))) {
+        fmt::println(stderr, "M6 set_tensor: '{}' -> device {}", tensor->name, (void*)bufctx->device.get());
+    }
 }
 
 static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer,
@@ -3219,6 +3223,14 @@ ggml_backend_metalium_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
     ggml_tensor_extra_metalium * dst_meta = (ggml_tensor_extra_metalium *)dst->extra;
 
     tt::tt_metal::Tensor& src_tensor = *src_meta->tensor;
+
+    // Cross-device copy (dual-ASIC layer split via submeshes): ttnn::identity only
+    // copies within the source device, which would silently leave the dst tensor on
+    // the wrong ASIC. Decline and let ggml fall back to a host get/set roundtrip.
+    ggml_backend_metalium_buffer_context * bufctx = (ggml_backend_metalium_buffer_context *)buffer->context;
+    if (src_tensor.device() != bufctx->device.get()) {
+        return false;
+    }
 
     tt::tt_metal::Tensor ret = ttnn::identity(src_tensor);
     GGML_ASSERT(ret.storage_type() == tt::tt_metal::StorageType::DEVICE);
@@ -4767,9 +4779,9 @@ static size_t ggml_backend_metalium_reg_get_device_count(ggml_backend_reg_t reg)
 }
 
 static ggml_backend_dev_t ggml_backend_metalium_reg_get_device(ggml_backend_reg_t reg, size_t index) {
-    GGML_UNUSED(index);
     ggml_backend_metalium_reg_context * ctx = (ggml_backend_metalium_reg_context *)reg->context;
-    return ctx->devices[0];
+    GGML_ASSERT(index < ctx->devices.size());
+    return ctx->devices[index];
 }
 
 static const ggml_backend_reg_i ggml_backend_metalium_reg_interface = {
@@ -4899,24 +4911,33 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
             fmt::println("Disabling persistent kernel cache. Things will be slower");
             tt::tt_metal::experimental::ClearKernelCache();
         }
-        // TODO: Support multiple devices (TT supports mesh configuration so it's going to be tricky)
-        // but for now we just work on 1 device at a time
+        // Multi-ASIC support: GGML_METALIUM_DEVICE_ID accepts a comma-separated list
+        // ("0,1") to expose each N300 ASIC as its own ggml backend device; llama.cpp
+        // then layer-splits across them (pipeline parallel — no fabric/CCL involved).
+        // A single id keeps the old behavior. Exclusive with GGML_METALIUM_MESH_SHAPE.
         static std::unique_ptr<ggml_backend_metalium_reg_context> ctx = std::make_unique<ggml_backend_metalium_reg_context>();
-        const size_t num_devices = 1;
-        int device_id = 0;
+        std::vector<int> device_ids = {0};
 
-        const char* device_id_env = getenv("GGML_METALIUM_DEVICE_ID"); // example GGML_METALIUM_DEVICE_ID=0 - use device 0
+        const char* device_id_env = getenv("GGML_METALIUM_DEVICE_ID"); // example GGML_METALIUM_DEVICE_ID=0 - use device 0; "0,1" for both N300 ASICs
         const char* mesh_env = getenv("GGML_METALIUM_MESH_SHAPE"); // example GGML_METALIUM_MESH_SHAPE=2,4 use mesh of shape 2,4
         ttnn::MeshShape mesh_shape;
         if(device_id_env != NULL && mesh_env != NULL) {
             GGML_ABORT("Both GGML_METALIUM_DEVICE_ID and GGML_METALIUM_MESH_SHAPE are set. Only one can be used at the same time");
         }
         if(device_id_env != NULL) {
-            try {
-                device_id = std::stoi(device_id_env);
-            }
-            catch(const std::invalid_argument& e) {
-                GGML_ABORT("Invalid device ID in GGML_METALIUM_DEVICE_ID");
+            device_ids.clear();
+            std::string_view ids_view(device_id_env);
+            size_t pos = 0;
+            while(pos <= ids_view.size()) {
+                size_t comma = ids_view.find(',', pos);
+                try {
+                    device_ids.push_back(std::stoi(std::string(ids_view.substr(pos, comma == std::string_view::npos ? comma : comma - pos))));
+                }
+                catch(const std::invalid_argument& e) {
+                    GGML_ABORT("Invalid device ID in GGML_METALIUM_DEVICE_ID");
+                }
+                if(comma == std::string_view::npos) break;
+                pos = comma + 1;
             }
         }
         if(mesh_env != NULL) {
@@ -4939,7 +4960,8 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
             mesh_shape = ttnn::MeshShape(x, y);
         }
 
-        ctx->devices.reserve(num_devices);
+        std::shared_ptr<ttnn::MeshDevice> parent_mesh;
+        auto open_one_device = [&](int device_id) {
         ggml_backend_metalium_device_context * dev_ctx = new ggml_backend_metalium_device_context;
         std::shared_ptr<ttnn::MeshDevice> device;
         // Trace region size. 0 = tt-metal DYNAMIC ALLOCATION MODE: during capture it tracks DRAM
@@ -4949,13 +4971,21 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
         // allocates per-op (like ours) accumulates and OOMs. So when tracing is on, use 0; else keep
         // tt-metal's default. Read the runtime flag (a test may have flipped it on before open).
         const size_t trace_region_size = g_metalium_trace_enabled ? 0 : DEFAULT_TRACE_REGION_SIZE;
-        if(mesh_env == NULL) {
+        if(parent_mesh != nullptr) {
+            // Multi-ASIC layer-split: carve a 1x1 submesh per ASIC out of the parent
+            // mesh. One control-plane init, no per-open fabric reconfig (which tt-metal
+            // forbids while devices are open), no CCL anywhere.
+            device = parent_mesh->create_submesh(ttnn::MeshShape(1, 1), tt::tt_metal::distributed::MeshCoordinate(device_id, 0));
+        }
+        else if(mesh_env == NULL) {
             device = ttnn::open_mesh_device(device_id, DEFAULT_L1_SMALL_SIZE, trace_region_size);
         }
         else {
             device = ttnn::distributed::open_mesh_device(mesh_shape, DEFAULT_L1_SMALL_SIZE, trace_region_size, 2, tt::tt_metal::DispatchCoreType::ETH);
         }
-        g_metalium_open_devices.push_back(device);
+        if(parent_mesh == nullptr) {
+            g_metalium_open_devices.push_back(device);
+        }
         std::atexit(ggml_metalium_close_all_devices); // track and kill on eexit
         if(!g_debug_flags.disable_program_cache) {
             ttnn::enable_program_cache(*device);
@@ -4997,6 +5027,25 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
             .context = dev_ctx
         };
         ctx->devices.push_back(dev);
+        };
+
+        if(mesh_env == NULL) {
+            if(device_ids.size() > 1) {
+                // Open the whole card once, then hand out 1x1 submeshes (one per ASIC).
+                const size_t trace_region_size = g_metalium_trace_enabled ? 0 : DEFAULT_TRACE_REGION_SIZE;
+                parent_mesh = ttnn::distributed::open_mesh_device(
+                    ttnn::MeshShape(device_ids.size(), 1), DEFAULT_L1_SMALL_SIZE, trace_region_size, 2,
+                    tt::tt_metal::DispatchCoreType::ETH);
+                g_metalium_open_devices.push_back(parent_mesh);
+            }
+            ctx->devices.reserve(device_ids.size());
+            for (int dev_id : device_ids) {
+                open_one_device(dev_id);
+            }
+        }
+        else {
+            open_one_device(0);
+        }
         // GGML does not have free for backend_reg and devices. Will force free on exit (thanks to RAII) but Metalium
         // already de-init at that point
         // g_backend_device_context_holder.push_back(std::unique_ptr<ggml_backend_metalium_device_context>(dev_ctx));

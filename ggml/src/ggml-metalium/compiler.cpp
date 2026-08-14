@@ -2277,6 +2277,12 @@ bool MacLowering::apply(ggml_backend_metalium_context * ctx, const Site & site) 
     auto b = realize_ggml_view(site.b);
     auto c = realize_ggml_view(site.c);
 
+    // layer-split debug: name cross-device operands before ttnn fatals
+    if (a->device() != b->device() || a->device() != c->device()) {
+        fmt::println(stderr, "M6 cross-device MacLowering: root='{}' a='{}' b='{}' c='{}'",
+            site.root->name, site.a->name, site.b->name, site.c->name);
+    }
+
     auto * meta = (ggml_tensor_extra_metalium *)site.root->extra;
     auto prod = ttnn::multiply(
         *a, *b,
