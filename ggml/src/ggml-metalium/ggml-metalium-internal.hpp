@@ -35,8 +35,23 @@ struct ggml_tensor_extra_metalium {
     // than via mesh-buffer introspection.
     bool m3_sharded = false;
 
+    // Weight-layout optimization: true when this (matmul-only) weight was stored
+    // transposed at upload — [1,1,K,N] instead of GGML's natural [1,1,N,K] — so
+    // matmul/linear run with transpose_b=false (~1.4x faster for both bf16 and
+    // block-float weights; transpose_b forces strided DRAM reads). The transpose
+    // is applied to the row-major tensor before tilize so block-float
+    // quantization stays single-pass (a post-tilize transpose dequant+requants).
+    bool weight_kn = false;
+
     bool is_row_folded() const { return row_folded != nullptr; }
 };
+
+// True when `w` is a weight stored [K,N] (see ggml_tensor_extra_metalium::weight_kn);
+// matmul sites pass transpose_b = !weight_kn(w).
+inline bool ggml_metalium_weight_kn(const ggml_tensor * w) {
+    auto * m = w != nullptr ? static_cast<ggml_tensor_extra_metalium*>(w->extra) : nullptr;
+    return m != nullptr && m->weight_kn;
+}
 
 struct ggml_backend_metalium_context {
     ttnn::IDevice* device = nullptr;
