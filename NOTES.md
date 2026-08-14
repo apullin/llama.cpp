@@ -207,3 +207,27 @@ tilize; flag ggml_tensor_extra_metalium::weight_kn; the three matmul
 emission sites (mul_mat, LinearLowering, ActLowering) pass
 transpose_b = !weight_kn. Kill switch: GGML_METALIUM_NO_WEIGHT_KN=1.
 Mesh sharding unaffected (shard along dim 2 happens before the transpose).
+
+
+## 2026-08-14: where decode time goes (post-[K,N], layer-split -ngl 99)
+
+Profiler: GGML_METALIUM_PROF=1 (host/op), PROF_SYNC=1 (adds device sync per op),
+PROF_NAMES=1 (per-node keys; some ggml name fields are unterminated/garbage —
+keys sanitized but junk names remain junk).
+
+- Wall 312 ms/tok (8-tok run, 3.2 t/s). Host dispatch ~102 ms/tok
+  (MUL 41us, ADD 113us, RMS_NORM 78us per call — slow ttnn dispatch).
+- Small-op probe (probe_smallops.cpp): mul/add ~35us, silu 28us,
+  rms_norm 145us pipelined; 10x mul chain = 32us/mul — no inter-op gap
+  beyond flat per-op cost. ~1200 small ops/tok ≈ 40 ms/tok.
+- Compute-config sweep (probe_ck.cpp): HiFi4 vs HiFi2 vs LoFi, fp32 acc
+  on/off — ALL WITHIN NOISE for bfp4 and bf16 decode matmuls. Matmuls are
+  at their floor; fidelity is NOT the lever.
+- Matmul estimate ~110-150 ms/tok. Residual ~100 ms/tok = per-op dispatch
+  of many distinct programs + non-op host time. Structural fix = trace
+  replay (blocked: graph keys embed KV length; needs shape-stable padded
+  decode graph).
+- KNOWN LIMIT: -ngl 99 dual-ASIC OOMs at pp512 (DRAM banks 100% full after
+  weights+KV; the 20MB [512,19968] FFN intermediate doesn't fit). pp64
+  fine. Predates the [K,N] change (no memory delta). Mitigations: fewer
+  ngl, activation release scheduling, smaller ubatch.
