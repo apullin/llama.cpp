@@ -25,6 +25,7 @@
 #include "ttnn/tensor/storage.hpp"
 #include "ttnn/tensor/tensor.hpp"
 #include "ttnn/distributed/distributed_tensor.hpp"
+#include <tt-metalium/experimental/fabric/fabric.hpp>
 #include "ttnn/operations/ccl/all_gather/all_gather.hpp"
 #include "ttnn/tensor/types.hpp"
 #include "ttnn/types.hpp"
@@ -125,7 +126,7 @@ struct ggml_backend_metalium_buffer_context {
     std::vector<std::unique_ptr<ggml_tensor_extra_metalium>> metadata_to_free;
 };
 
-static bool ggml_tt_tensors_shape_equal(const ggml_tensor* ggtensor, const tt::tt_metal::Tensor& ttensor)
+static bool ggml_tt_tensors_shape_equal(const ggml_tensor* ggtensor, const ttnn::Tensor& ttensor)
 {
     const ttnn::Shape& shape = ttensor.logical_shape();
     for(size_t i = 0; i < std::min<size_t>(GGML_MAX_DIMS, shape.size()); i++) {
@@ -536,14 +537,14 @@ static tt::tt_metal::HostBuffer quantized_ggml_data_to_tt_host_buffer(const void
 // This function works by deciding if the tensor is already in the desired format, and if not
 // convert to FP32 then convert into the desired format
 template <typename SrcType>
-static void copy_tt_tensor_to_host_pointer(const tt::tt_metal::Tensor& tensor, void* dst, ggml_type dst_ggtype) {
+static void copy_tt_tensor_to_host_pointer(const ttnn::Tensor& tensor, void* dst, ggml_type dst_ggtype) {
     ttnn::Shape shape = tensor.logical_shape();
     ttnn::Shape padded_shape = tensor.padded_shape();
 
     // we only support reading from these types that is held in TT tensor
     static_assert(std::is_same_v<SrcType, float> || std::is_same_v<SrcType, bfloat16> || std::is_same_v<SrcType, uint32_t>);
 
-    tt::tt_metal::Tensor row_major_tensor = tensor;
+    ttnn::Tensor row_major_tensor = tensor;
     if(tensor.layout() == ttnn::TILE_LAYOUT) {
         // Convert tile -> row-major on device, then copy to host. The host-side
         // Thanks TT for finally fixing this
@@ -731,7 +732,7 @@ static bool is_integer_type(ggml_type type)
     return std::find(integer_types.begin(), integer_types.end(), type) != integer_types.end();
 }
 
-tt::tt_metal::Tensor reshape_tt_tensor_into_ggml(const tt::tt_metal::Tensor& tensor, const struct ggml_tensor * node)
+ttnn::Tensor reshape_tt_tensor_into_ggml(const ttnn::Tensor& tensor, const struct ggml_tensor * node)
 {
     if(ggml_tt_tensors_shape_equal(node, tensor)) {
         return tensor;
@@ -767,7 +768,7 @@ tt::tt_metal::Tensor reshape_tt_tensor_into_ggml(const tt::tt_metal::Tensor& ten
 
 // Attempt to write value into the existing tensor buffer so tracing can work (needing a stable address
 // ) this API likely needs rethinking because creating a new tensor here MIGHT break tracing.
-void ggml_metalium_store_tensor(ggml_tensor_extra_metalium* meta, tt::tt_metal::Tensor value)
+void ggml_metalium_store_tensor(ggml_tensor_extra_metalium* meta, ttnn::Tensor value)
 {
     const auto& cur = meta->tensor;
     meta->row_folded.reset();
@@ -780,11 +781,11 @@ void ggml_metalium_store_tensor(ggml_tensor_extra_metalium* meta, tt::tt_metal::
         && cur->logical_shape() == value.logical_shape()) {
         ttnn::copy(value, *cur);   // write into the existing buffer -> address preserved
     } else {
-        meta->tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(value));
+        meta->tensor = std::make_shared<ttnn::Tensor>(std::move(value));
     }
 }
 
-void ggml_metalium_store_tensor(ggml_tensor_extra_metalium* meta, std::shared_ptr<tt::tt_metal::Tensor> value)
+void ggml_metalium_store_tensor(ggml_tensor_extra_metalium* meta, std::shared_ptr<ttnn::Tensor> value)
 {
     meta->row_folded.reset();
     meta->tensor = std::move(value);
@@ -792,7 +793,7 @@ void ggml_metalium_store_tensor(ggml_tensor_extra_metalium* meta, std::shared_pt
 
 static void ggml_metalium_store_row_folded(
         ggml_tensor_extra_metalium* meta,
-        std::shared_ptr<tt::tt_metal::Tensor> value)
+        std::shared_ptr<ttnn::Tensor> value)
 {
     meta->tensor.reset();
     meta->row_folded = std::move(value);
@@ -803,7 +804,7 @@ static void ggml_metalium_store_row_folded(
 // the result into the underlying tensor when the view covers it entirely, otherwise
 // later graphs would read stale data. Partial writes cannot be expressed and are
 // rejected at supports_op time.
-static void metalium_persist_inplace_view(const ggml_tensor* node, const std::shared_ptr<tt::tt_metal::Tensor>& value)
+static void metalium_persist_inplace_view(const ggml_tensor* node, const std::shared_ptr<ttnn::Tensor>& value)
 {
     ggml_tensor* root = node->view_src;
     if(root == NULL || root->extra == NULL) {
@@ -817,7 +818,7 @@ static void metalium_persist_inplace_view(const ggml_tensor* node, const std::sh
 }
 
 static bool ggml_metalium_can_narrow_dram_interleaved(
-        const tt::tt_metal::Tensor& tensor,
+        const ttnn::Tensor& tensor,
         uint32_t dim,
         uint32_t start,
         uint32_t length) {
@@ -879,8 +880,8 @@ static bool ggml_metalium_can_narrow_dram_interleaved(
 }
 
 template<typename SliceVec>
-static tt::tt_metal::Tensor ggml_metalium_narrow_or_slice(
-        const tt::tt_metal::Tensor& tensor,
+static ttnn::Tensor ggml_metalium_narrow_or_slice(
+        const ttnn::Tensor& tensor,
         uint32_t dim,
         uint32_t start,
         uint32_t length,
@@ -894,8 +895,8 @@ static tt::tt_metal::Tensor ggml_metalium_narrow_or_slice(
 }
 
 template<typename SliceVec>
-static tt::tt_metal::Tensor ggml_metalium_narrow_single_dim_or_slice(
-        const tt::tt_metal::Tensor& tensor,
+static ttnn::Tensor ggml_metalium_narrow_single_dim_or_slice(
+        const ttnn::Tensor& tensor,
         const SliceVec& slice_begins,
         const SliceVec& slice_ends,
         const SliceVec& slice_step) {
@@ -928,9 +929,9 @@ static tt::tt_metal::Tensor ggml_metalium_narrow_single_dim_or_slice(
     return ttnn::slice(tensor, slice_begins, slice_ends, slice_step);
 }
 
-static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_tensor* tensor);
-static tt::tt_metal::Tensor ggml_metalium_row_unfold(const tt::tt_metal::Tensor& folded);
-std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor* tensor)
+static std::shared_ptr<ttnn::Tensor> realize_ggml_view_impl(const ggml_tensor* tensor);
+static ttnn::Tensor ggml_metalium_row_unfold(const ttnn::Tensor& folded);
+std::shared_ptr<ttnn::Tensor> realize_ggml_view(const ggml_tensor* tensor)
 {
     ggml_tensor_extra_metalium* meta = static_cast<ggml_tensor_extra_metalium*>(tensor->extra);
     // A consumer that needs the canonical layout of a row-folded tensor (e.g. ggml_concat consuming
@@ -938,7 +939,7 @@ std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor* tenso
     // XXX: The compiler SHOULD guarantee that the row-folded tensor doesn't have downstream
     // consumers that would be affected by the unfolding, but aparantly there are
     if(meta != nullptr && meta->is_row_folded()) {
-        return std::make_shared<tt::tt_metal::Tensor>(ggml_metalium_row_unfold(*meta->row_folded));
+        return std::make_shared<ttnn::Tensor>(ggml_metalium_row_unfold(*meta->row_folded));
     }
     auto res = realize_ggml_view_impl(tensor);
     // Sharded (M3) tensors legitimately report a per-device shard shape that differs
@@ -955,7 +956,7 @@ std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view(const ggml_tensor* tenso
 }
 
 
-static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_tensor* tensor)
+static std::shared_ptr<ttnn::Tensor> realize_ggml_view_impl(const ggml_tensor* tensor)
 {
     // Since TTNN does not support the traditional view operation, we had to support it ourselves
     // This function, realize, extracts the data from the source tensor and creates a new tensor
@@ -969,11 +970,11 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
     if(op == GGML_OP_TRANSPOSE) {
         auto parent = realize_ggml_view(src0);
         auto res = ttnn::transpose(*parent, -2, -1);
-        return std::make_shared<tt::tt_metal::Tensor>(res);
+        return std::make_shared<ttnn::Tensor>(res);
     }
     if(op == GGML_OP_VIEW) {
 
-        std::shared_ptr<tt::tt_metal::Tensor> parent = realize_ggml_view(tensor->view_src);
+        std::shared_ptr<ttnn::Tensor> parent = realize_ggml_view(tensor->view_src);
         std::array dst_size = std::to_array(tensor->ne);
         std::array dst_stride = std::to_array(tensor->nb);
         std::array src_size = std::to_array(src0->ne);
@@ -1021,7 +1022,7 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
         std::reverse(start.begin(), start.end());
         std::reverse(end.begin(), end.end());
         std::reverse(step.begin(), step.end());
-        tt::tt_metal::Tensor res;
+        ttnn::Tensor res;
 
         if(g_debug_flags.print_view) {
             // Debug prints to help debug complicated view operations
@@ -1064,7 +1065,7 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
             std::array<uint32_t, GGML_MAX_DIMS> start{0, 0, 0, offset_elements};
             std::array<uint32_t, GGML_MAX_DIMS> end({1, 1, 1, dst_volume + offset_elements});
             std::array<uint32_t, GGML_MAX_DIMS> step = {1, 1, 1, 1};
-            tt::tt_metal::Tensor tmp = ggml_metalium_narrow_single_dim_or_slice(*parent, start, end, step);
+            ttnn::Tensor tmp = ggml_metalium_narrow_single_dim_or_slice(*parent, start, end, step);
             res = reshape_tt_tensor_into_ggml(tmp, tensor);
         }
         // 1-D contiguous sub-view (with offset) of a contiguous parent: it is a flat
@@ -1094,14 +1095,14 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
                     std::array<uint32_t, GGML_MAX_DIMS> rstep{1, 1, 1, 1};
                     const uint32_t dim = pshape[1] == 1 ? 0 : 1;
                     res = ggml_metalium_narrow_or_slice(*parent, dim, row, 1, rstart, rend, rstep);
-                    return std::make_shared<tt::tt_metal::Tensor>(std::move(res));
+                    return std::make_shared<ttnn::Tensor>(std::move(res));
                 }
             }
-            tt::tt_metal::Tensor flat = ttnn::reshape(*parent, ttnn::Shape({1, 1, 1, parent_volume}));
+            ttnn::Tensor flat = ttnn::reshape(*parent, ttnn::Shape({1, 1, 1, parent_volume}));
             std::array<uint32_t, GGML_MAX_DIMS> fstart{0, 0, 0, offset_elements};
             std::array<uint32_t, GGML_MAX_DIMS> fend{1, 1, 1, dst_volume + offset_elements};
             std::array<uint32_t, GGML_MAX_DIMS> fstep{1, 1, 1, 1};
-            tt::tt_metal::Tensor tmp = ggml_metalium_narrow_single_dim_or_slice(flat, fstart, fend, fstep);
+            ttnn::Tensor tmp = ggml_metalium_narrow_single_dim_or_slice(flat, fstart, fend, fstep);
             res = reshape_tt_tensor_into_ggml(tmp, tensor);
         }
         // Flat (contiguous) view of a multi-dimensional parent whose generic per-dim step degenerated to 0
@@ -1118,7 +1119,7 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
             std::array<uint32_t, GGML_MAX_DIMS> start{0, 0, r0, 0};
             std::array<uint32_t, GGML_MAX_DIMS> end{pshape[0], pshape[1], r1, Cc};
             std::array<uint32_t, GGML_MAX_DIMS> step = {1, 1, 1, 1};
-            tt::tt_metal::Tensor tmp = ggml_metalium_narrow_single_dim_or_slice(*parent, start, end, step);
+            ttnn::Tensor tmp = ggml_metalium_narrow_single_dim_or_slice(*parent, start, end, step);
             res = reshape_tt_tensor_into_ggml(tmp, tensor);
         }
         // The fast path, this is what TTNN is designed for (direct slicing)
@@ -1126,11 +1127,11 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
             res = ggml_metalium_narrow_single_dim_or_slice(*parent, start, end, step);
         }
 
-        return std::make_shared<tt::tt_metal::Tensor>(std::move(res));
+        return std::make_shared<ttnn::Tensor>(std::move(res));
     }
     if(op == GGML_OP_RESHAPE) {
         auto t = realize_ggml_view(src0);
-        return std::make_shared<tt::tt_metal::Tensor>(reshape_tt_tensor_into_ggml(*t, tensor));
+        return std::make_shared<ttnn::Tensor>(reshape_tt_tensor_into_ggml(*t, tensor));
     }
     if(op == GGML_OP_PERMUTE) {
         std::array<int32_t, GGML_MAX_DIMS> permute;
@@ -1165,7 +1166,7 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
         }
 
         auto res = ttnn::permute(*t, permute_tt_real);
-        return std::make_shared<tt::tt_metal::Tensor>(std::move(res));
+        return std::make_shared<ttnn::Tensor>(std::move(res));
     }
 
     ggml_tensor_extra_metalium* meta = (ggml_tensor_extra_metalium*)tensor->extra;
@@ -1184,7 +1185,7 @@ static std::shared_ptr<tt::tt_metal::Tensor> realize_ggml_view_impl(const ggml_t
     // auto tt_type = ggml2tt_type(tensor->type, meta->tensor->device()->arch());
     // auto shape = ttnn::Shape({uint32_t(tensor->ne[3]), uint32_t(tensor->ne[2]), uint32_t(tensor->ne[1]), uint32_t(tensor->ne[0])});
     // auto res = ttnn::tilize_with_zero_padding(ttnn::zeros(shape, tt::tt_metal::DataType::BFLOAT16).to_device(meta->tensor->device()), std::nullopt, tt_type);
-    // meta->tensor = std::make_shared<tt::tt_metal::Tensor>(res);
+    // meta->tensor = std::make_shared<ttnn::Tensor>(res);
     // return meta->tensor;
     fmt::println(stderr, "Tensor \"{}\" getting through fallback path. OP = {}, dtype={}", tensor->name, ggml_op_name(tensor->op), ggml_type_name(tensor->type));
     GGML_ASSERT(false && "Fallback path not implemented");
@@ -1203,28 +1204,25 @@ static bool ggml_backend_metalium_can_mul_mat(const struct ggml_tensor * dst)
         (src0->ne[3] == src1->ne[3] || src0->ne[3] == 1);
 }
 
-tt::tt_metal::Tensor ggml_metalium_m3_gather(tt::tt_metal::Tensor out, const ggml_tensor * weight)
+ttnn::Tensor ggml_metalium_m3_gather(ttnn::Tensor out, const ggml_tensor * weight)
 {
     auto * wmeta = weight != nullptr ? static_cast<ggml_tensor_extra_metalium*>(weight->extra) : nullptr;
     if (wmeta == nullptr || !wmeta->m3_sharded) {
         return out;
     }
     static const bool m3_no_gather = getenv("GGML_METALIUM_M3_NO_GATHER") != nullptr;
-    static const bool m3_ccl = getenv("GGML_METALIUM_M3_CCL") != nullptr;
+    static const bool m3_host_gather = getenv("GGML_METALIUM_M3_HOST_GATHER") != nullptr;
     if (m3_no_gather) {
         return out;
     }
-    if (m3_ccl) {
-        // CCL all_gather over the inter-chip fabric. NOTE: wedges the command
-        // queue on our N300 (single inter-chip link, pinned tt-metal 13adda80)
-        // even with a 1-channel mesh graph descriptor and Linear/NeighborExchange
-        // topology — matmul itself syncs fine, the CCL kernel never completes.
-        // Kept behind an env until the fabric stack is sorted.
+    if (!m3_host_gather) {
+        // CCL all_gather over the inter-chip fabric. Requires SetFabricConfig(FABRIC_1D)
+        // before device open (done in the backend reg when a mesh shape is requested);
+        // without it the CCL kernel never completes on this N300's single link.
         return ttnn::all_gather(out, -1, 0);
     }
-    // Host-roundtrip gather: read each device's partial output, concat on host,
-    // re-upload replicated. Costs a sync + PCIe roundtrip per sharded matmul,
-    // but needs no working fabric.
+    // Host-roundtrip fallback: read each device's partial output, concat on host,
+    // re-upload replicated. Works without fabric; costs a sync + PCIe roundtrip.
     auto* mesh = static_cast<ttnn::MeshDevice*>(out.device());
     auto composer = ttnn::distributed::concat_mesh_to_tensor_composer(*mesh, 3);
     return ttnn::distributed::aggregate_tensor(out, *composer).to_device(mesh);
@@ -1306,7 +1304,7 @@ static ggml_tensor_extra_metalium* ggml_metalium_resolve_folded(const ggml_tenso
 // relayout internally (a manual untilize would inject hardware padding and corrupt the order). This
 // is the temporary bridge to the WKV kernel, which still wants canonical state -- see memory
 // rwkv-cache-rowfold-unfold-decision.
-static tt::tt_metal::Tensor ggml_metalium_row_unfold(const tt::tt_metal::Tensor& folded) {
+static ttnn::Tensor ggml_metalium_row_unfold(const ttnn::Tensor& folded) {
     const auto s = folded.logical_shape().to_array_4D();   // [1, R, dim/32, 32]
     const uint32_t R = s[1];
     const uint32_t dim = s[2] * s[3];
@@ -1314,7 +1312,7 @@ static tt::tt_metal::Tensor ggml_metalium_row_unfold(const tt::tt_metal::Tensor&
 }
 
 // Fold canonical [1, 1, R, dim] (TILE) -> [1, R, dim/32, 32] (TILE).
-static tt::tt_metal::Tensor ggml_metalium_row_fold(const tt::tt_metal::Tensor& canonical) {
+static ttnn::Tensor ggml_metalium_row_fold(const ttnn::Tensor& canonical) {
     const auto s = canonical.logical_shape().to_array_4D();  // [1, 1, R, dim]
     const uint32_t R = s[2];
     const uint32_t dim = s[3];
@@ -1417,8 +1415,8 @@ static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struc
                 ggml_nelements(src0) == ggml_nelements(flat_src) &&
                 (uint64_t)ggml_nelements(flat_src) == (uint64_t)dim * cells && (dim % 32) == 0;
 
-            std::shared_ptr<tt::tt_metal::Tensor> ordering_handle;  // flat canonical (fallback only)
-            tt::tt_metal::Tensor folded_new;
+            std::shared_ptr<ttnn::Tensor> ordering_handle;  // flat canonical (fallback only)
+            ttnn::Tensor folded_new;
             if(direct_fold) {
                 auto base_tt = realize_ggml_view(flat_src);          // [1,1,R,inner], NO flatten
                 folded_new = ttnn::reshape(*base_tt, ttnn::Shape({1, cells, dim / 32, 32}));  // -> dense fold
@@ -1452,11 +1450,11 @@ static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struc
     // TODO: Check we are not writing into a view
     auto res = realize_ggml_view(src0);
     if(!ggml_tt_tensors_shape_equal(dst, *res)) {
-        res = std::make_shared<tt::tt_metal::Tensor>(reshape_tt_tensor_into_ggml(*res, dst));
+        res = std::make_shared<ttnn::Tensor>(reshape_tt_tensor_into_ggml(*res, dst));
     }
     auto result_type = ggml2tt_type(dst->type, res->device()->arch());
     if(res->dtype() != result_type) {
-        res = std::make_shared<tt::tt_metal::Tensor>(ttnn::typecast(*res, result_type));
+        res = std::make_shared<ttnn::Tensor>(ttnn::typecast(*res, result_type));
     }
     if(dst->op == GGML_OP_CPY) {
         auto* src1 = dst->src[1];
@@ -1481,7 +1479,7 @@ static bool ggml_backend_metalium_activations(ggml_backend_metalium_context * ct
 
     auto src_tensor = realize_ggml_view(src0);
 
-    tt::tt_metal::Tensor ret;
+    ttnn::Tensor ret;
     switch (op) {
         case GGML_UNARY_OP_ABS:
             ret = ttnn::abs(*src_tensor);
@@ -1565,19 +1563,19 @@ static void ggml_backend_metalium_bin_op(ggml_backend_metalium_context * ctx, st
     auto src_tensor0 = realize_ggml_view(src0);
     auto src_tensor1 = realize_ggml_view(src1);
 
-    std::shared_ptr<tt::tt_metal::Tensor> ret;
+    std::shared_ptr<ttnn::Tensor> ret;
     switch(op) {
         case GGML_OP_ADD:
-            ret = std::make_shared<tt::tt_metal::Tensor>(ttnn::add(*src_tensor0, *src_tensor1));
+            ret = std::make_shared<ttnn::Tensor>(ttnn::add(*src_tensor0, *src_tensor1));
             break;
         case GGML_OP_MUL:
-            ret = std::make_shared<tt::tt_metal::Tensor>(ttnn::multiply(*src_tensor0, *src_tensor1));
+            ret = std::make_shared<ttnn::Tensor>(ttnn::multiply(*src_tensor0, *src_tensor1));
             break;
         case GGML_OP_SUB:
-            ret = std::make_shared<tt::tt_metal::Tensor>(ttnn::subtract(*src_tensor0, *src_tensor1));
+            ret = std::make_shared<ttnn::Tensor>(ttnn::subtract(*src_tensor0, *src_tensor1));
             break;
         case GGML_OP_DIV:
-            ret = std::make_shared<tt::tt_metal::Tensor>(ttnn::divide(*src_tensor0, *src_tensor1));
+            ret = std::make_shared<ttnn::Tensor>(ttnn::divide(*src_tensor0, *src_tensor1));
             break;
         default:
             GGML_ASSERT(false && "Unsupported binary operation");
@@ -1623,7 +1621,7 @@ static void ggml_backend_metalium_set(ggml_backend_metalium_context * ctx, struc
         ggml_metalium_store_tensor(dst_meta, res);
     }
     else {
-        std::shared_ptr<tt::tt_metal::Tensor> tensor = std::make_shared<tt::tt_metal::Tensor>(res);
+        std::shared_ptr<ttnn::Tensor> tensor = std::make_shared<ttnn::Tensor>(res);
         ggml_metalium_store_tensor(src0_meta, tensor);
         ggml_metalium_store_tensor(dst_meta, tensor);
     }
@@ -1757,7 +1755,7 @@ static void ggml_backend_metalium_get_rows(ggml_backend_metalium_context * ctx, 
         // consumer read a generation that a later in-place cache write has already clobbered. WKV7
         // consumes the snapshot folded; any other consumer (concat of the token-shift cache) unfolds
         // it on demand in realize_ggml_view.
-        ggml_metalium_store_row_folded(dst_meta, std::make_shared<tt::tt_metal::Tensor>(
+        ggml_metalium_store_row_folded(dst_meta, std::make_shared<ttnn::Tensor>(
             ttnn::clone(*folded->row_folded, std::nullopt, std::nullopt, std::nullopt)));
         return;
     }
@@ -1868,7 +1866,7 @@ static void ggml_backend_metalium_norm(ggml_backend_metalium_context * ctx, stru
         return;
     }
 
-    tt::tt_metal::Tensor res;
+    ttnn::Tensor res;
     if(rms) {
         res = ttnn::rms_norm(*t, esp);
     }
@@ -1992,7 +1990,7 @@ static void ggml_backend_metalium_concat(ggml_backend_metalium_context * ctx, st
     memcpy(&axis, dst->op_params, sizeof(axis));
     axis = GGML_MAX_DIMS - axis - 1;
 
-    std::vector<tt::tt_metal::Tensor> targets = {*src_tensor0, *src_tensor1};
+    std::vector<ttnn::Tensor> targets = {*src_tensor0, *src_tensor1};
     ggml_metalium_store_tensor(dst_meta, ttnn::concat(targets, axis));
 }
 
@@ -2020,13 +2018,13 @@ static void ggml_backend_metalium_softmax(ggml_backend_metalium_context * ctx, s
     auto x = *realize_ggml_view(dst->src[0]);
     if(dst->src[1] == NULL) {
         *dst_meta = {
-            .tensor = std::make_shared<tt::tt_metal::Tensor>(ttggml::soft_max(x, scale))
+            .tensor = std::make_shared<ttnn::Tensor>(ttggml::soft_max(x, scale))
         };
     }
     else {
         auto mask = *realize_ggml_view(dst->src[1]);
         *dst_meta = {
-            .tensor = std::make_shared<tt::tt_metal::Tensor>(ttggml::soft_max(x, mask, scale))
+            .tensor = std::make_shared<ttnn::Tensor>(ttggml::soft_max(x, mask, scale))
         };
     }
 #else
@@ -2035,7 +2033,7 @@ static void ggml_backend_metalium_softmax(ggml_backend_metalium_context * ctx, s
     const ggml_tensor *src1 = dst->src[1];
 
     auto t = realize_ggml_view(src0);
-    tt::tt_metal::Tensor x = *t;
+    ttnn::Tensor x = *t;
     // XXX: TTNN's own implementation does not handle broadcasting as GGML wants
     // if(src1 != nullptr) {
     //     auto mask = realize_ggml_view(src1);
@@ -2485,11 +2483,11 @@ static void ggml_backend_metalium_rwkv_wkv7(ggml_backend_metalium_context * ctx,
     // State (src[6]) always reaches the reader row-folded [1,G,Es/32,32]. Fast path: the state gather
     // propagated the folded handle, consume it with zero relayout. Fallback (op test, canonical state):
     // fold on entry, one relayout per WKV7 call.
-    std::shared_ptr<tt::tt_metal::Tensor> state;
+    std::shared_ptr<ttnn::Tensor> state;
     if (ggml_tensor_extra_metalium* folded = ggml_metalium_resolve_folded(dst->src[6])) {
         state = folded->row_folded;
     } else {
-        state = std::make_shared<tt::tt_metal::Tensor>(ggml_metalium_row_fold(*realize_ggml_view(dst->src[6])));
+        state = std::make_shared<ttnn::Tensor>(ggml_metalium_row_fold(*realize_ggml_view(dst->src[6])));
     }
 
     // r/w/k/v (src 0..3) are [n_embd,T]->[S,H,T] head reshapes in the real model. Feed the un-reshaped
@@ -2498,7 +2496,7 @@ static void ggml_backend_metalium_rwkv_wkv7(ggml_backend_metalium_context * ctx,
     // guard (RESHAPE of a contiguous [S*H,T] parent) means a non-reshape src -- e.g. test-backend-ops
     // leaf inputs -- stays on the reshaped path; invoke() then detects the reshaped shape and never
     // defines WKV7_INPUT_FLAT, so host and reader agree.
-    auto realize_wkv7_input = [&](int i) -> std::shared_ptr<tt::tt_metal::Tensor> {
+    auto realize_wkv7_input = [&](int i) -> std::shared_ptr<ttnn::Tensor> {
         const ggml_tensor* s = dst->src[i];
         if (i >= 0 && i <= 3
             && s->op == GGML_OP_RESHAPE && s->src[0] != nullptr) {
@@ -2832,7 +2830,7 @@ static void ggml_backend_metalium_set_tensor_folded(ggml_backend_metalium_buffer
         GGML_ASSERT(false && "Unsupported folded cache data type");
     }
 
-    tt::tt_metal::Tensor chunk(std::move(*storage), ttnn::Shape({1, cells, dim / 32, 32}),
+    ttnn::Tensor chunk(std::move(*storage), ttnn::Shape({1, cells, dim / 32, 32}),
         tt::tt_metal::DataType::BFLOAT16, tt::tt_metal::Layout::ROW_MAJOR);
     const tt::tt_metal::DataType final_type = ggml2tt_type(ggtype, bufctx->device->arch());
     chunk = ttnn::tilize_with_zero_padding(chunk.to_device(bufctx->device.get()), std::nullopt, final_type);
@@ -2977,7 +2975,7 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
         permute = perm;
     }
 
-    tt::tt_metal::Tensor t(std::move(*storage), ttnn::Shape(shape)
+    ttnn::Tensor t(std::move(*storage), ttnn::Shape(shape)
         , intermidiate_type, tt::tt_metal::Layout::ROW_MAJOR);
 
     tt::tt_metal::DataType final_type = ggml2tt_type(ggtype, bufctx->device->arch());
@@ -3018,7 +3016,7 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
         }
     }
 
-    auto to_device_tensor = [&]() -> tt::tt_metal::Tensor {
+    auto to_device_tensor = [&]() -> ttnn::Tensor {
         if (should_shard) {
             fmt::println(stderr, "M3 shard upload: '{}' ne=[{},{},{},{}]",
                 tensor->name, tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]);
@@ -3094,7 +3092,7 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
     // std::cout << "get_tensor():\n";
     // std::cout << "  GGML thinks shape: " << tensor->ne[0] << " " << tensor->ne[1] << " " << tensor->ne[2] << " " << tensor->ne[3] << std::endl;
     // std::cout << "  TTNN thinks shape: " << shape << std::endl;
-    std::shared_ptr<tt::tt_metal::Tensor> t;
+    std::shared_ptr<ttnn::Tensor> t;
     if(tensor->op == GGML_OP_TRANSPOSE) {
         // std::cout << "Reading out to transpose tensor" << std::endl;
         // HACK: Yeah this one is stupid. GGML as a row-major framework uses lazy evaluation for transpose.
@@ -3135,7 +3133,7 @@ static void ggml_backend_metalium_buffer_get_tensor(ggml_backend_buffer_t buffer
         GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, *t));
     }
     if(t->dtype() != tt::tt_metal::DataType::BFLOAT16 && t->dtype() != tt::tt_metal::DataType::FLOAT32 && t->dtype() != tt::tt_metal::DataType::UINT32) {
-        t = std::make_shared<tt::tt_metal::Tensor>(ttnn::typecast(*t, tt::tt_metal::DataType::BFLOAT16));
+        t = std::make_shared<ttnn::Tensor>(ttnn::typecast(*t, tt::tt_metal::DataType::BFLOAT16));
     }
 
     // TODO: Proper handling of data types
@@ -3187,14 +3185,14 @@ ggml_backend_metalium_buffer_init_tensor(ggml_backend_buffer_t buffer,
         auto z = ttnn::zeros(ttnn::Shape({1, n_rows, dim / 32, 32}),
             ggml2tt_type(tensor->type, bufctx->device->arch()), tt::tt_metal::Layout::ROW_MAJOR);
         z = ttnn::tilize_with_zero_padding(z.to_device(bufctx->device.get()));
-        meta->row_folded = std::make_shared<tt::tt_metal::Tensor>(std::move(z));
+        meta->row_folded = std::make_shared<ttnn::Tensor>(std::move(z));
     }
     else if(std::string_view(name).find("cache") != std::string::npos && tensor->op == GGML_OP_NONE) {
         std::vector<uint32_t> shape(tensor->ne, tensor->ne + GGML_MAX_DIMS);
         std::reverse(shape.begin(), shape.end());
         auto t = ttnn::zeros(ttnn::Shape(shape), ggml2tt_type(tensor->type, bufctx->device->arch()), tt::tt_metal::Layout::ROW_MAJOR);
         t = ttnn::tilize_with_zero_padding(t.to_device(bufctx->device.get()));
-        meta->tensor = std::make_shared<tt::tt_metal::Tensor>(std::move(t));
+        meta->tensor = std::make_shared<ttnn::Tensor>(std::move(t));
     }
     // std::cout << "Creating tensor with address: " << tensor->data << ", shape = " << tensor->ne[0] << " " << tensor->ne[1] << " " << tensor->ne[2] << " " << tensor->ne[3] << ", name " << tensor->name << std::endl;
     GGML_UNUSED(buffer);
@@ -3222,7 +3220,7 @@ ggml_backend_metalium_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
     ggml_tensor_extra_metalium * src_meta = (ggml_tensor_extra_metalium *)src->extra;
     ggml_tensor_extra_metalium * dst_meta = (ggml_tensor_extra_metalium *)dst->extra;
 
-    tt::tt_metal::Tensor& src_tensor = *src_meta->tensor;
+    ttnn::Tensor& src_tensor = *src_meta->tensor;
 
     // Cross-device copy (dual-ASIC layer split via submeshes): ttnn::identity only
     // copies within the source device, which would silently leave the dst tensor on
@@ -3232,7 +3230,7 @@ ggml_backend_metalium_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
         return false;
     }
 
-    tt::tt_metal::Tensor ret = ttnn::identity(src_tensor);
+    ttnn::Tensor ret = ttnn::identity(src_tensor);
     GGML_ASSERT(ret.storage_type() == tt::tt_metal::StorageType::DEVICE);
     ggml_metalium_store_tensor(dst_meta, std::move(ret));
     return true;
@@ -3356,12 +3354,12 @@ struct metalium_trace_exec_state {
     // Captured per-node device tensors, by node index.
     // @note The backend allocates a fresh node->extra every pass, so replay must re-bind these;
     //   see metalium_trace_dispatch::rebind_nodes / snapshot_nodes.
-    std::vector<std::shared_ptr<tt::tt_metal::Tensor>> node_tensors;
+    std::vector<std::shared_ptr<ttnn::Tensor>> node_tensors;
 
     // Lazily-memoized replay plan
     bool replay_plan_built = false;
-    std::vector<std::pair<ggml_tensor*, std::shared_ptr<tt::tt_metal::Tensor>>> pin_plan;  // input node + baked anchor
-    std::vector<std::pair<int, std::shared_ptr<tt::tt_metal::Tensor>>> rebind_plan;        // boundary node idx + tensor
+    std::vector<std::pair<ggml_tensor*, std::shared_ptr<ttnn::Tensor>>> pin_plan;  // input node + baked anchor
+    std::vector<std::pair<int, std::shared_ptr<ttnn::Tensor>>> rebind_plan;        // boundary node idx + tensor
 };
 
 
@@ -3408,7 +3406,7 @@ struct GGMLTensorEqual
 struct MetaliumBackendRuntime {
     MetaliumReleaseScheduler release_sched;
     std::map<uint64_t, metalium_trace_exec_state> trace_exec_states;
-    std::unordered_map<GGMLTensorMeta, std::shared_ptr<tt::tt_metal::Tensor>, GGMLTensorHasher, GGMLTensorEqual> pinned_tensors;
+    std::unordered_map<GGMLTensorMeta, std::shared_ptr<ttnn::Tensor>, GGMLTensorHasher, GGMLTensorEqual> pinned_tensors;
 };
 
 static void metalium_backend_runtime_free(MetaliumBackendRuntime * runtime) {
@@ -3434,7 +3432,7 @@ static void ggml_metalium_trace_mem_report(ttnn::MeshDevice* mesh, MetaliumBacke
     if(runtime == nullptr) return;
 
     std::unordered_set<uint64_t> seen;
-    auto buf_bytes = [&](const std::shared_ptr<tt::tt_metal::Tensor>& t) -> uint64_t {
+    auto buf_bytes = [&](const std::shared_ptr<ttnn::Tensor>& t) -> uint64_t {
         if(!t || t->storage_type() != tt::tt_metal::StorageType::DEVICE) return 0;
         try {
             uint64_t addr = (uint64_t)t->buffer()->address();
@@ -3529,7 +3527,7 @@ struct metalium_trace_dispatch {
     // Copy t's freshly-fed device tensor into its baked anchor so the trace reads it at the stable
     // address. Pointer-equal (already there) or incompatible -> no-op. No map lookup: the anchor is
     // supplied by the caller (the cached plan), so this is the per-replay hot path.
-    static void apply_pin(ggml_tensor* t, const std::shared_ptr<tt::tt_metal::Tensor>& anchor) {
+    static void apply_pin(ggml_tensor* t, const std::shared_ptr<ttnn::Tensor>& anchor) {
         if(t->extra == nullptr) return;
         auto* m = (ggml_tensor_extra_metalium*)t->extra;
         if(m->tensor == nullptr || m->tensor->storage_type() != tt::tt_metal::StorageType::DEVICE) return;
@@ -5044,6 +5042,10 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
             }
         }
         else {
+            // CCL (all_gather over the inter-chip link) needs the fabric explicitly armed
+            // for workloads before any device is opened; the device manager otherwise
+            // enables FABRIC_1D "for dispatch only" and CCL kernels never complete.
+            tt::tt_fabric::SetFabricConfig(tt::tt_fabric::FabricConfig::FABRIC_1D);
             open_one_device(0);
         }
         // GGML does not have free for backend_reg and devices. Will force free on exit (thanks to RAII) but Metalium

@@ -131,7 +131,7 @@ public:
         if (a_meta->row_folded == nullptr) {
             auto canonical = realize_ggml_view(dst->src[0]);
             auto variant = ttnn::typecast(ttggml::EmbeddingFoldVariant::invoke(*canonical), tt::tt_metal::DataType::BFLOAT8_B);
-            a_meta->row_folded = std::make_shared<tt::tt_metal::Tensor>(std::move(variant));
+            a_meta->row_folded = std::make_shared<ttnn::Tensor>(std::move(variant));
             a_meta->tensor.reset();
         }
 
@@ -2113,9 +2113,9 @@ bool LerpLowering::apply(ggml_backend_metalium_context * ctx, const Site & site)
 
     // ttnn::lerp requires start/end/weight share a dtype; activations and the weight may differ.
     const auto dt = cur->dtype();
-    auto match_dtype = [&](std::shared_ptr<tt::tt_metal::Tensor> & t) {
+    auto match_dtype = [&](std::shared_ptr<ttnn::Tensor> & t) {
         if (t->dtype() != dt) {
-            t = std::make_shared<tt::tt_metal::Tensor>(ttnn::typecast(*t, dt));
+            t = std::make_shared<ttnn::Tensor>(ttnn::typecast(*t, dt));
         }
     };
     match_dtype(x_prev);
@@ -2159,7 +2159,7 @@ bool LinearLowering::apply(ggml_backend_metalium_context * ctx, const Site & sit
 
     // linear adds bias in the output dtype (input_a == b); make the bias agree.
     if (bias->dtype() != b->dtype()) {
-        bias = std::make_shared<tt::tt_metal::Tensor>(ttnn::typecast(*bias, b->dtype()));
+        bias = std::make_shared<ttnn::Tensor>(ttnn::typecast(*bias, b->dtype()));
     }
 
     auto out = ttnn::operations::matmul::linear(
@@ -2191,9 +2191,9 @@ bool NormAffineLowering::apply(ggml_backend_metalium_context * ctx, const Site &
 
     // gamma/beta must agree with the activation dtype.
     const auto dt = x->dtype();
-    auto match_dtype = [&](std::shared_ptr<tt::tt_metal::Tensor> & t) {
+    auto match_dtype = [&](std::shared_ptr<ttnn::Tensor> & t) {
         if (t->dtype() != dt) {
-            t = std::make_shared<tt::tt_metal::Tensor>(ttnn::typecast(*t, dt));
+            t = std::make_shared<ttnn::Tensor>(ttnn::typecast(*t, dt));
         }
     };
     match_dtype(weight);
@@ -2220,16 +2220,16 @@ bool TtprmNormAffineLowering::apply(ggml_backend_metalium_context * ctx, const S
 
     const auto BF16 = tt::tt_metal::DataType::BFLOAT16;
     if (x->dtype() != BF16) {
-        x = std::make_shared<tt::tt_metal::Tensor>(ttnn::typecast(*x, BF16));
+        x = std::make_shared<ttnn::Tensor>(ttnn::typecast(*x, BF16));
     }
     if (weight->dtype() != BF16) {
-        weight = std::make_shared<tt::tt_metal::Tensor>(ttnn::typecast(*weight, BF16));
+        weight = std::make_shared<ttnn::Tensor>(ttnn::typecast(*weight, BF16));
     }
     if (bias->dtype() != BF16) {
-        bias = std::make_shared<tt::tt_metal::Tensor>(ttnn::typecast(*bias, BF16));
+        bias = std::make_shared<ttnn::Tensor>(ttnn::typecast(*bias, BF16));
     }
 
-    auto live = [](const tt::tt_metal::Tensor & t) {
+    auto live = [](const ttnn::Tensor & t) {
         ttprm::View v = ttprm::view_of(t);
         return v.slice({ { 0, v.rows(), 1 }, { 0, v.cols(), 1 } });
     };
@@ -2360,17 +2360,17 @@ bool MulActLowering::apply(ggml_backend_metalium_context * ctx, const Site & sit
 // -> the caller falls back to a native recompute. This is the second half of the generic facility.
 struct BuiltView {
     std::optional<ttprm::View>                         view;
-    std::shared_ptr<tt::tt_metal::Tensor>              result; // materialized top-of-chain (for storing)
-    std::vector<std::shared_ptr<tt::tt_metal::Tensor>> keep;   // bases + intermediate ttprm results
+    std::shared_ptr<ttnn::Tensor>              result; // materialized top-of-chain (for storing)
+    std::vector<std::shared_ptr<ttnn::Tensor>> keep;   // bases + intermediate ttprm results
     bool                                               ok = true;
 };
 
 static BuiltView build_view_chain(const ViewChain & vc, int64_t hs, int64_t hc, int64_t nt) {
     const int64_t n_embd = hs * hc;
     const auto    BF16   = tt::tt_metal::DataType::BFLOAT16;
-    auto to_bf16 = [&](std::shared_ptr<tt::tt_metal::Tensor> & t) {
+    auto to_bf16 = [&](std::shared_ptr<ttnn::Tensor> & t) {
         if (t->dtype() != BF16) {
-            t = std::make_shared<tt::tt_metal::Tensor>(ttnn::typecast(*t, BF16));
+            t = std::make_shared<ttnn::Tensor>(ttnn::typecast(*t, BF16));
         }
     };
     auto whole = [](const ttprm::View & v) { // peel the live rows off the padded tile grid before reshape
@@ -2406,7 +2406,7 @@ static BuiltView build_view_chain(const ViewChain & vc, int64_t hs, int64_t hc, 
             if (!c.ok) { out.ok = false; return out; }
             auto r = ttprm::layer_norm(*c.view, /*gamma=*/nullptr, /*beta=*/nullptr, vc.eps);
             if (!r) { out.ok = false; return out; }
-            auto rt = std::make_shared<tt::tt_metal::Tensor>(r.value());
+            auto rt = std::make_shared<ttnn::Tensor>(r.value());
             out.keep = std::move(c.keep);
             out.keep.push_back(rt);
             out.result = rt;
@@ -2421,7 +2421,7 @@ static BuiltView build_view_chain(const ViewChain & vc, int64_t hs, int64_t hc, 
                    : vc.op == GGML_OP_SUB ? ttprm::sub(*a.view, *b.view)
                    :                        ttprm::mul(*a.view, *b.view);
             if (!r) { out.ok = false; return out; }
-            auto rt = std::make_shared<tt::tt_metal::Tensor>(r.value());
+            auto rt = std::make_shared<ttnn::Tensor>(r.value());
             out.keep = std::move(a.keep);
             for (auto & k : b.keep) {
                 out.keep.push_back(k);
@@ -2467,7 +2467,7 @@ bool L2HeadNormLowering::apply(ggml_backend_metalium_context * ctx, const Site &
         return false;
     }
     if (br->dtype() != ar->dtype()) {
-        br = std::make_shared<tt::tt_metal::Tensor>(ttnn::typecast(*br, ar->dtype()));
+        br = std::make_shared<ttnn::Tensor>(ttnn::typecast(*br, ar->dtype()));
     }
 
     ttprm::View av = ttprm::view_of(*ar);
@@ -2552,9 +2552,9 @@ bool HeadAffineLowering::apply(ggml_backend_metalium_context * ctx, const Site &
         return true;
     }
     // The absorbed nodes are inert, so fallback recomputes the native result here.
-    auto to_bf16 = [&](std::shared_ptr<tt::tt_metal::Tensor> & t) {
+    auto to_bf16 = [&](std::shared_ptr<ttnn::Tensor> & t) {
         if (t->dtype() != BF16) {
-            t = std::make_shared<tt::tt_metal::Tensor>(ttnn::typecast(*t, BF16));
+            t = std::make_shared<ttnn::Tensor>(ttnn::typecast(*t, BF16));
         }
     };
     auto nf = realize_ggml_view(site.norm_flat); to_bf16(nf); // [n_embd, nt]
@@ -2580,9 +2580,9 @@ bool RkGateLowering::apply(ggml_backend_metalium_context * ctx, const Site & sit
     const int64_t n_embd = hs * hc;
     const auto    BF16   = tt::tt_metal::DataType::BFLOAT16;
 
-    auto to_bf16 = [&](std::shared_ptr<tt::tt_metal::Tensor> & t) {
+    auto to_bf16 = [&](std::shared_ptr<ttnn::Tensor> & t) {
         if (t->dtype() != BF16) {
-            t = std::make_shared<tt::tt_metal::Tensor>(ttnn::typecast(*t, BF16));
+            t = std::make_shared<ttnn::Tensor>(ttnn::typecast(*t, BF16));
         }
     };
     auto head_realize = [&](ggml_tensor * node) {
@@ -2601,7 +2601,7 @@ bool RkGateLowering::apply(ggml_backend_metalium_context * ctx, const Site & sit
     auto vt = head_realize(site.v);
     auto wt = realize_ggml_view(site.r_k); to_bf16(wt);
 
-    auto head_view = [&](const tt::tt_metal::Tensor & t) {
+    auto head_view = [&](const ttnn::Tensor & t) {
         ttprm::View tv = ttprm::view_of(t);
         return tv.slice({ { 0, tv.rows(), 1 }, { 0, tv.cols(), 1 } }).reshape({ hc * nt, hs });
     };
@@ -2627,7 +2627,7 @@ bool RkGateLowering::apply(ggml_backend_metalium_context * ctx, const Site & sit
     ttprm::View wv  = wv0.slice({ { 0, wv0.rows(), 1 }, { 0, wv0.cols(), 1 } }).reshape({ hc, hs });
 
     BuiltView                             cur_bv;   // keeps the head-grid chain's tensors alive for `cv`
-    std::shared_ptr<tt::tt_metal::Tensor> ct;       // legacy flat realize (non-absorb path)
+    std::shared_ptr<ttnn::Tensor> ct;       // legacy flat realize (non-absorb path)
     std::optional<ttprm::View>            cv;
     if (site.absorb_cur) {
         GGML_ASSERT(site.cur_ttprm_view);
@@ -2670,11 +2670,11 @@ bool RkGateLowering::apply(ggml_backend_metalium_context * ctx, const Site & sit
     // cur for the fallback add: legacy path realized it flat (ct); the absorb path already built the
     // head-grid cur (cur_bv.result) so flatten THAT (the cur chain is inert and can't be re-realized). The
     // absorb gate (hc % 32 == 0) guarantees cur_bv built whenever absorb_cur, so one of these always holds.
-    std::shared_ptr<tt::tt_metal::Tensor> cur_flat;
+    std::shared_ptr<ttnn::Tensor> cur_flat;
     if (ct) {
         cur_flat = ct;
     } else if (cur_bv.result) {
-        cur_flat = std::make_shared<tt::tt_metal::Tensor>(reshape_tt_tensor_into_ggml(*cur_bv.result, site.root));
+        cur_flat = std::make_shared<ttnn::Tensor>(reshape_tt_tensor_into_ggml(*cur_bv.result, site.root));
     } else {
         cur_flat = realize_ggml_view(site.cur); // cur was left live (not absorbed)
     }
@@ -2697,9 +2697,9 @@ bool KUpdateLowering::apply(ggml_backend_metalium_context * ctx, const Site & si
     const int64_t nt     = site.root->ne[1];
     const auto    BF16   = tt::tt_metal::DataType::BFLOAT16;
 
-    auto to_bf16 = [&](std::shared_ptr<tt::tt_metal::Tensor> & t) {
+    auto to_bf16 = [&](std::shared_ptr<ttnn::Tensor> & t) {
         if (t->dtype() != BF16) {
-            t = std::make_shared<tt::tt_metal::Tensor>(ttnn::typecast(*t, BF16));
+            t = std::make_shared<ttnn::Tensor>(ttnn::typecast(*t, BF16));
         }
     };
 
@@ -2707,7 +2707,7 @@ bool KUpdateLowering::apply(ggml_backend_metalium_context * ctx, const Site & si
     auto at  = realize_ggml_view(site.a);   to_bf16(at);
     auto kat = realize_ggml_view(site.k_a); to_bf16(kat);
 
-    auto head_flat = [&](const tt::tt_metal::Tensor & t) {
+    auto head_flat = [&](const ttnn::Tensor & t) {
         ttprm::View v = ttprm::view_of(t);
         return v.slice({ { 0, v.rows(), 1 }, { 0, v.cols(), 1 } }).reshape({ hc * nt, hs });
     };
@@ -2756,9 +2756,9 @@ bool ElemwiseViewLowering::apply(ggml_backend_metalium_context * ctx, const Site
     const int64_t nt     = site.op_node->ne[2];
     const auto    BF16   = tt::tt_metal::DataType::BFLOAT16;
 
-    auto to_bf16 = [&](std::shared_ptr<tt::tt_metal::Tensor> & t) {
+    auto to_bf16 = [&](std::shared_ptr<ttnn::Tensor> & t) {
         if (t->dtype() != BF16) {
-            t = std::make_shared<tt::tt_metal::Tensor>(ttnn::typecast(*t, BF16));
+            t = std::make_shared<ttnn::Tensor>(ttnn::typecast(*t, BF16));
         }
     };
 
@@ -2824,11 +2824,11 @@ bool ActLowering::apply(ggml_backend_metalium_context * ctx, const Site & site) 
     auto b = realize_ggml_view(site.input);
     ttnn::Activation act{ site.act };
 
-    tt::tt_metal::Tensor out;
+    ttnn::Tensor out;
     if (site.is_linear) {
         auto bias = realize_ggml_view(site.bias);
         if (bias->dtype() != b->dtype()) {
-            bias = std::make_shared<tt::tt_metal::Tensor>(ttnn::typecast(*bias, b->dtype()));
+            bias = std::make_shared<ttnn::Tensor>(ttnn::typecast(*bias, b->dtype()));
         }
         out = ttnn::operations::matmul::linear(
             *b, *a, *bias, /*transpose_a*/ false, /*transpose_b*/ true,
