@@ -17,6 +17,7 @@ ggml_add_backend_library(ggml-metalium
 
 target_include_directories(ggml-metalium PRIVATE
     $ENV{TT_METAL_HOME}/build/include
+    $ENV{TT_METAL_HOME}/build/include/metalium-thirdparty
     # Metalium
     $ENV{TT_METAL_HOME}
     $ENV{TT_METAL_HOME}/tt_metal
