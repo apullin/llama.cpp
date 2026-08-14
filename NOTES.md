@@ -136,3 +136,32 @@ multi-backend layer split. No fabric/CCL. Output token-identical to mesh
 full-offload run. Trace mode: captures but never replays (per-token graph
 keys differ — KV length is baked into graph shapes; replay needs a
 shape-stable padded decode graph).
+
+
+## 2026-08-13 evening: CCL fixed + perf diagnosis (Kimi)
+
+- CCL all_gather works on BOTH the pinned 13adda80 and upstream-main
+  tt-metal. The missing call was tt::tt_fabric::SetFabricConfig(FABRIC_1D)
+  BEFORE opening any device (backend does this now when a mesh shape is
+  requested). Without it the fabric is armed "for dispatch only" and CCL
+  kernels never complete. Commit 4a45908.
+- tt-metal upstream-main build lives at
+  ~/personal/tenstorrent/generated/tt-metal-upstream (built OK; needs
+  system libssl-dev + libopenmpi-dev, toolbin clang-20, ninja, and a
+  CMake RPATH cache seed). Backend port to it is STARTED (build-ttnew):
+  Tensor moved to ttnn:: namespace (sed done, compiles both trees), but
+  the custom device ops (embedding fold/gather, softmax, wkv7) hit the
+  new device-op API and still need porting. Only finish if a feature
+  there proves worth it.
+- Perf: mesh+CCL = 2.4 t/s, layer-split = 2.47 t/s, mesh+host-gather =
+  1.38 t/s. All modes converge ~2.5 t/s => the gather was never the main
+  cost. Host profile (GGML_METALIUM_PROF=1): node-loop host time is only
+  ~20% of wall (MUL_MAT ~35us host-side). Device-side execution dominates.
+- Probe: default-config decode matmul [1,6656]x[6656,19968]^T bf16 takes
+  2.03ms (~131GB/s = 45% DRAM peak). Decode-optimized program configs
+  require L1-sharded activations (width-sharded L1 residency + multicast
+  matmul configs, per tt-metal LLM demo idiom). That conversion is the
+  next big lever.
+- Trace mode captures but never replays: per-token graph keys differ
+  (KV length baked into graph shapes). Replay needs a shape-stable
+  padded decode graph.
