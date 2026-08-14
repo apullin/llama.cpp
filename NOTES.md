@@ -165,3 +165,45 @@ shape-stable padded decode graph).
 - Trace mode captures but never replays: per-token graph keys differ
   (KV length baked into graph shapes). Replay needs a shape-stable
   padded decode graph.
+
+
+## 2026-08-14: decode matmul probe matrix + [K,N] weight storage (Kimi)
+
+Probe matrix (/tmp/mesh_probe/probe_mmperf.cpp, single ASIC, M=1 decode shapes,
+20 iters after warmup). "default+T" = what the backend used to do
+(weight [N,K], transpose_b=true), "default" = weight stored [K,N],
+"dramshard" = demo DRAM-sharded idiom (weight DRAM-width-sharded over the 12
+banks, activation padded to M=32 and L1-width-sharded over 16 cores,
+MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig):
+
+| shape (K x N) | dtype | default+T | default | dramshard |
+|---|---|---|---|---|
+| 6656x19968 | bf16 | 2.04 ms | 1.45 ms | 1.08 ms (86% DRAM peak) |
+| 6656x19968 | bfp4 | 0.59 ms | **0.42 ms** | 0.71 ms (WORSE) |
+| 6656x6656  | bf16 | 0.59 ms | 0.47 ms | n/a (N%12 banks != 0) |
+| 6656x6656  | bfp4 | 0.156 ms | **0.149 ms** | n/a |
+
+Conclusions:
+- Weights ARE quantized on device (Q4_K -> BFLOAT4_B at tilize) and ttnn
+  matmul dequants bfp4 natively in-kernel: 3.4x faster than bf16.
+- DRAM-sharding LOSES for bfp4: quantized weight traffic is already small,
+  so the matmul is compute-bound and the dram-sharded kernel uses fewer
+  cores. The demo idiom is tuned for bf16/bfp8 weight streaming.
+- The free win: store weights [K,N] and drop transpose_b (1.4x on every
+  matmul). transpose_b forces strided DRAM reads.
+- DRAM-sharded grid recipe that works on this N300 (for the record):
+  cores = largest c<=64 with (K/32)%c==0 && (N/32)%c==0 that factors
+  cols*rows with both <=8 (K=6656,N=19968 -> 16 cores as 8x2);
+  weight ShardSpec over the 12 DRAM-bank cores [K, N/12] ROW_MAJOR requires
+  N % (32*12) == 0; activation must be padded to a full M=32 tile row
+  before L1 width-sharding or ShardSpec alignment fatals.
+- bfp4 transpose on TILE layout dequants+requants (roundtrip err 0.109) —
+  NEVER transpose quantized tiles. Transpose the row-major tensor pre-tilize
+  (exact for bf16/f32), then tilize to bfp4 as the single quantization step.
+
+Backend change (tt-dual-asic): whitelist MUL_MAT-only weights are transposed
+[1,1,N,K] -> [1,1,K,N] on the row-major device tensor at upload, before
+tilize; flag ggml_tensor_extra_metalium::weight_kn; the three matmul
+emission sites (mul_mat, LinearLowering, ActLowering) pass
+transpose_b = !weight_kn. Kill switch: GGML_METALIUM_NO_WEIGHT_KN=1.
+Mesh sharding unaffected (shard along dim 2 happens before the transpose).

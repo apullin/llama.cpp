@@ -2166,7 +2166,7 @@ bool LinearLowering::apply(ggml_backend_metalium_context * ctx, const Site & sit
         *b, *a,
         /* bias                   = */ *bias,
         /* transpose_a            = */ false,
-        /* transpose_b            = */ true,
+        /* transpose_b            = */ !ggml_metalium_weight_kn(site.weight),
         /* memory_config          = */ meta->memory_config,
         /* dtype                  = */ std::nullopt,
         /* program_config         = */ std::nullopt,
@@ -2819,7 +2819,8 @@ bool ActLowering::apply(ggml_backend_metalium_context * ctx, const Site & site) 
     GGML_METALIUM_OP_SANITY_CHECK(site.root);
     auto * meta = (ggml_tensor_extra_metalium *)site.root->extra;
 
-    // Same operand mapping as the backend's MUL_MAT lowering: (b=input, a=weight, transpose_b=true).
+    // Same operand mapping as the backend's MUL_MAT lowering: (b=input, a=weight,
+    // transpose_b = weight stored [N,K]; [K,N]-stored weights skip the transpose).
     auto a = realize_ggml_view(site.weight);
     auto b = realize_ggml_view(site.input);
     ttnn::Activation act{ site.act };
@@ -2831,12 +2832,12 @@ bool ActLowering::apply(ggml_backend_metalium_context * ctx, const Site & site) 
             bias = std::make_shared<ttnn::Tensor>(ttnn::typecast(*bias, b->dtype()));
         }
         out = ttnn::operations::matmul::linear(
-            *b, *a, *bias, /*transpose_a*/ false, /*transpose_b*/ true,
+            *b, *a, *bias, /*transpose_a*/ false, /*transpose_b*/ !ggml_metalium_weight_kn(site.weight),
             meta->memory_config, std::nullopt, std::nullopt, /*activation*/ act,
             make_compute_kernel_config(b->device()));
     } else {
         out = ttnn::operations::matmul::matmul(
-            *b, *a, /*transpose_a*/ false, /*transpose_b*/ true,
+            *b, *a, /*transpose_a*/ false, /*transpose_b*/ !ggml_metalium_weight_kn(site.weight),
             meta->memory_config, std::nullopt, std::nullopt, /*activation*/ act,
             make_compute_kernel_config(b->device()));
     }

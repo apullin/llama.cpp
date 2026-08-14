@@ -943,8 +943,9 @@ std::shared_ptr<ttnn::Tensor> realize_ggml_view(const ggml_tensor* tensor)
     }
     auto res = realize_ggml_view_impl(tensor);
     // Sharded (M3) tensors legitimately report a per-device shard shape that differs
-    // from the GGML view shape; only enforce the check for replicated/host tensors.
-    bool distributed = meta != nullptr && meta->m3_sharded;
+    // from the GGML view shape; [K,N]-stored weights are transposed relative to GGML.
+    // Only enforce the check for replicated/host tensors in canonical layout.
+    bool distributed = meta != nullptr && (meta->m3_sharded || meta->weight_kn);
     if(!distributed && !ggml_tt_tensors_shape_equal(tensor, *res)) {
         std::cout << "FATAL ERROR: Shape mismatch between TTNN and GGML after view op " << ggml_op_name(tensor->op)
             << " tensor '" << tensor->name << "' storage=" << (int)res->storage_type() << "\n"
@@ -1269,7 +1270,7 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
         auto out = ttnn::operations::matmul::matmul(
             b, a,
             /* transpose_a            = */ false,
-            /* transpose_b            = */ true,
+            /* transpose_b            = */ !ggml_metalium_weight_kn(src0),
             /* memory_config          = */ dst_meta->memory_config,
             /* dtype                  = */ std::nullopt,
             /* program_config         = */ std::nullopt,
@@ -2992,24 +2993,30 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     int shard_dim = -1;
     static const bool m3_no_shard = getenv("GGML_METALIUM_M3_NO_SHARD") != nullptr;
     size_t num_devices = bufctx->device->get_devices().size();
+    bool name_ok = false;
+    for (const char* suffix : shard_whitelist) {
+        std::string_view name(tensor->name);
+        if (name.size() >= strlen(suffix) && name.substr(name.size() - strlen(suffix)) == suffix) {
+            name_ok = true;
+            break;
+        }
+    }
+    int non_one_dims = 0;
+    for (int i = 0; i < GGML_MAX_DIMS; i++) {
+        if (tensor->ne[i] != 1) non_one_dims++;
+    }
+    // [K,N] weight storage: matmul-only 2D weights are transposed before tilize so
+    // matmul runs with transpose_b=false (~1.4x faster; transpose_b forces strided
+    // DRAM reads). Applies with or without mesh sharding. Kill switch for A/B.
+    static const bool no_weight_kn = getenv("GGML_METALIUM_NO_WEIGHT_KN") != nullptr;
+    const bool weight_kn = name_ok && non_one_dims == 2 && tilize && !no_weight_kn;
     if (num_devices > 1 && !m3_no_shard) {
         size_t tensor_bytes = ggml_nbytes(tensor);
         const size_t min_shard_bytes = 1024 * 1024; // 1 MiB
-        bool name_ok = false;
-        for (const char* suffix : shard_whitelist) {
-            std::string_view name(tensor->name);
-            if (name.size() >= strlen(suffix) && name.substr(name.size() - strlen(suffix)) == suffix) {
-                name_ok = true;
-                break;
-            }
-        }
         if (name_ok && tensor_bytes >= min_shard_bytes) {
-            int non_one_dims = 0;
-            for (int i = 0; i < GGML_MAX_DIMS; i++) {
-                if (tensor->ne[i] != 1) non_one_dims++;
-            }
             if (non_one_dims == 2 && tensor->ne[1] % 64 == 0) {
                 // For 2D tensors, TT shape is [1,1,ne1,ne0]; shard along ne1 -> TT dim 2
+                // (the [K,N] transpose happens after distribution, so shard_dim is unaffected)
                 should_shard = true;
                 shard_dim = 2;
             }
@@ -3031,6 +3038,12 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
 
     if(tilize) {
         auto dev_t = to_device_tensor();
+        if (weight_kn) {
+            // Store [1,1,K,N] instead of GGML's natural [1,1,N,K]. Done on the
+            // row-major tensor so the tilize below is the only quantization step
+            // (transposing block-float tiles would dequant+requant).
+            dev_t = ttnn::transpose(dev_t, 2, 3);
+        }
         t = ttnn::tilize_with_zero_padding(dev_t, std::nullopt, final_type);
         if(permute.has_value()) {
             if (should_shard) fmt::println(stderr, "M3 permute after tilize: '{}'", tensor->name);
@@ -3045,13 +3058,14 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
 
     GGML_ASSERT(t.storage_type() == tt::tt_metal::StorageType::DEVICE);
     GGML_ASSERT(t.dtype() == final_type);
-    // Skip shape equality check for sharded tensors (distributed)
-    if (!should_shard) {
+    // Skip shape equality check for sharded (distributed) and [K,N]-stored tensors
+    if (!should_shard && !weight_kn) {
         GGML_ASSERT(ggml_tt_tensors_shape_equal(tensor, t));
     }
     GGML_ASSERT(t.layout() == (tilize ? tt::tt_metal::Layout::TILE : tt::tt_metal::Layout::ROW_MAJOR));
     ggml_metalium_store_tensor(meta, std::move(t));
     meta->m3_sharded = should_shard;
+    meta->weight_kn = weight_kn;
     if (should_shard) fmt::println(stderr, "M3 upload complete: '{}'", tensor->name);
     static const bool m6_debug = getenv("GGML_METALIUM_M6_DEBUG") != nullptr;
     if (m6_debug && (strstr(tensor->name, "l_out-26") || strstr(tensor->name, "Metalium"))) {
