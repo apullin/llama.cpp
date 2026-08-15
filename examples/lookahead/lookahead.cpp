@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <clocale>
+#include <cstdlib>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -49,9 +50,13 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    const int W = 15; // lookahead window
-    const int N = 5;  // n-gram size
-    const int G = 15; // max verification n-grams
+    auto env_int = [](const char * name, int fallback) {
+        const char * value = std::getenv(name);
+        return value != nullptr ? std::max(1, std::atoi(value)) : fallback;
+    };
+    const int W = env_int("LLAMA_LOOKAHEAD_W", 15); // lookahead window
+    const int N = std::max(2, env_int("LLAMA_LOOKAHEAD_N", 5));  // n-gram size
+    const int G = env_int("LLAMA_LOOKAHEAD_G", 15); // max verification n-grams
 
     // lookahead requires W + G + 1 sequences for parallel Jacobi decoding
     params.n_parallel = W + G + 1;

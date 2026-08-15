@@ -745,6 +745,30 @@ private:
     mutable std::unordered_map<const ggml_tensor *, Site> sites_;
 };
 
+// Fusing RMS norm and its learned scale.
+//   MUL(RMS_NORM(x), weight)
+class RmsNormScaleLowering final : public FusionLoweringBase {
+public:
+    struct Site {
+        ggml_tensor * root   = nullptr;
+        ggml_tensor * norm   = nullptr;
+        ggml_tensor * x      = nullptr;
+        ggml_tensor * weight = nullptr;
+        std::vector<ggml_tensor *> kill_requests;
+    };
+
+    std::string_view name() const override { return "rms_norm_scale"; }
+    void resetPlan() const override { sites_.clear(); }
+    std::optional<FusionCandidate> matchFusion(ggml_tensor * node, const FusionFacts & facts) const override;
+    bool bindFusion(ggml_tensor * node, const FusionFacts & facts) const override;
+    bool lowerFusion(ggml_backend_metalium_context * ctx, ggml_tensor * node) const override;
+    std::optional<Site> match(ggml_tensor * mul, const FusionFacts & facts) const;
+    bool apply(ggml_backend_metalium_context * ctx, const Site & site) const;
+    static bool shape(const Site & site);
+private:
+    mutable std::unordered_map<const ggml_tensor *, Site> sites_;
+};
+
 // Same graph shape as NormAffineLowering, but prefer ttprm for plain layer norm.
 //   ADD(MUL(NORM(x), weight), bias)
 //
@@ -1129,6 +1153,7 @@ DEFINE_FUSION_PLUMBING(LerpLowering)
 DEFINE_FUSION_PLUMBING(LinearLowering)
 DEFINE_FUSION_PLUMBING(TtprmNormAffineLowering)
 DEFINE_FUSION_PLUMBING(NormAffineLowering)
+DEFINE_FUSION_PLUMBING(RmsNormScaleLowering)
 DEFINE_FUSION_PLUMBING(ActLowering)
 DEFINE_FUSION_PLUMBING(ScaleActLowering)
 DEFINE_FUSION_PLUMBING(UnaryActLowering)
@@ -1216,6 +1241,47 @@ LinearLowering::match(ggml_tensor * add, const FusionFacts & facts) const {
         return std::nullopt;
     }
     site.kill_requests = std::move(r->kill_requests);
+    return site;
+}
+
+bool RmsNormScaleLowering::shape(const RmsNormScaleLowering::Site & site) {
+    ggml_tensor * norm = site.norm;
+    ggml_tensor * x = site.x;
+    ggml_tensor * weight = site.weight;
+    if (norm == nullptr || x == nullptr || weight == nullptr || norm->op != GGML_OP_RMS_NORM) {
+        return false;
+    }
+    // The affine TTNN kernel helps prompt batches but regresses single-token decode.
+    if (x->ne[0] == 1 || x->ne[0] != norm->ne[0] || ggml_nelements(x) == x->ne[0]) {
+        return false;
+    }
+    const int64_t n = norm->ne[0];
+    if (weight->ne[0] != n || weight->ne[1] != 1 || weight->ne[2] != 1 || weight->ne[3] != 1) {
+        return false;
+    }
+    return weight->op == GGML_OP_NONE;
+}
+
+std::optional<RmsNormScaleLowering::Site>
+RmsNormScaleLowering::match(ggml_tensor * mul, const FusionFacts & facts) const {
+    GGML_UNUSED(facts);
+    static const Pat pattern = [] {
+        Pat norm = op(GGML_OP_RMS_NORM)
+            .bind(&RmsNormScaleLowering::Site::norm)
+            .kill()
+            .of(any().bind(&RmsNormScaleLowering::Site::x));
+        return any_order(GGML_OP_MUL)
+            .bind(&RmsNormScaleLowering::Site::root)
+            .guard(&RmsNormScaleLowering::shape)
+            .of(norm, any().bind(&RmsNormScaleLowering::Site::weight));
+    }();
+
+    auto result = match_site<RmsNormScaleLowering::Site>(pattern, mul);
+    if (!result) {
+        return std::nullopt;
+    }
+    RmsNormScaleLowering::Site site = std::move(result->site);
+    site.kill_requests = std::move(result->kill_requests);
     return site;
 }
 
@@ -2178,6 +2244,26 @@ bool LinearLowering::apply(ggml_backend_metalium_context * ctx, const Site & sit
     return true;
 }
 
+bool RmsNormScaleLowering::apply(ggml_backend_metalium_context * ctx, const Site & site) const {
+    GGML_UNUSED(ctx);
+    GGML_METALIUM_OP_SANITY_CHECK(site.root);
+
+    auto x = realize_ggml_view(site.x);
+    auto weight = realize_ggml_view(site.weight);
+
+    float eps = 0.0f;
+    memcpy(&eps, site.norm->op_params, sizeof(eps));
+
+    if (weight->dtype() != x->dtype()) {
+        weight = std::make_shared<ttnn::Tensor>(ttnn::typecast(*weight, x->dtype()));
+    }
+
+    auto out = ttnn::rms_norm(*x, eps, *weight);
+    auto * meta = (ggml_tensor_extra_metalium *)site.root->extra;
+    ggml_metalium_store_tensor(meta, std::move(out));
+    return true;
+}
+
 bool NormAffineLowering::apply(ggml_backend_metalium_context * ctx, const Site & site) const {
     GGML_UNUSED(ctx);
     GGML_METALIUM_OP_SANITY_CHECK(site.root);
@@ -2860,6 +2946,7 @@ MetaliumGraphCompiler::MetaliumGraphCompiler() {
     lowerings.push_back(std::make_unique<LinearLowering>());
     lowerings.push_back(std::make_unique<TtprmNormAffineLowering>());
     lowerings.push_back(std::make_unique<NormAffineLowering>());
+    lowerings.push_back(std::make_unique<RmsNormScaleLowering>());
     lowerings.push_back(std::make_unique<MacLowering>());
     lowerings.push_back(std::make_unique<MulActLowering>());
     lowerings.push_back(std::make_unique<ElemwiseViewLowering>());

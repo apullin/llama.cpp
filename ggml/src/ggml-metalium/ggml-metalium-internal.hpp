@@ -27,6 +27,8 @@ struct ggml_tensor_extra_metalium {
     std::shared_ptr<ttnn::Tensor> row_folded;
 
     std::optional<tt::tt_metal::MemoryConfig> memory_config;
+    // Host shadow for dynamic scalar indices; lets KV updates use TTNN update_cache without a readback.
+    std::optional<int32_t> host_i32_scalar;
 
     // M3 dual-ASIC: true when this tensor was sharded across the mesh at upload
     // (column-parallel weight shard along GGML ne1). This tt-metal build reports
