@@ -4,9 +4,11 @@
 #include "log.h"
 #include "sampling.h"
 #include "llama.h"
+#include "../../src/llama-ext.h"
 #include "chat.h"
 
 #include <clocale>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -149,6 +151,13 @@ int llama_completion(int argc, char ** argv) {
     if (ctx == NULL) {
         LOG_ERR("%s: error: unable to create context\n", __func__);
         return 1;
+    }
+
+    if (std::getenv("LLAMA_DIAG_EXTRACT_EAGLE3_LAYERS") != nullptr) {
+        for (uint32_t lid : { 2U, 18U, 33U }) {
+            llama_set_embeddings_layer_inp(ctx, lid, true);
+        }
+        LOG_INF("%s: extracting EAGLE3 target layer inputs [2, 18, 33]\n", __func__);
     }
 
     llama_memory_t mem = llama_get_memory(ctx);

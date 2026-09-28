@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <clocale>
+#include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <set>
@@ -206,6 +208,27 @@ int main(int argc, char ** argv) {
     int n_drafted = 0;
     int n_accept  = 0;
 
+    const bool detail_timing = std::getenv("LLAMA_SPEC_TREE_TIMING") != nullptr;
+    const bool rectangular_target =
+            std::getenv("LLAMA_SPEC_TREE_RECTANGULAR_TARGET") != nullptr;
+    const auto timing_now = [&]() -> int64_t {
+        return detail_timing ? ggml_time_us() : 0;
+    };
+    int64_t t_accept_us            = 0;
+    int64_t t_reconcile_us         = 0;
+    int64_t t_draft_seed_decode_us = 0;
+    int64_t t_tree_total_us        = 0;
+    int64_t t_tree_decode_us       = 0;
+    int64_t t_target_prepare_us    = 0;
+    int64_t t_target_decode_us     = 0;
+    int64_t t_post_target_us       = 0;
+    int64_t n_target_batch_tokens  = 0;
+    int64_t n_target_padding_tokens = 0;
+    int64_t n_draft_batch_tokens   = 0;
+    int n_cycles = 0;
+    int n_target_calls = 0;
+    int n_draft_calls = 0;
+
     int n_past_tgt = inp.size();
     int n_past_dft = inp.size();
 
@@ -215,12 +238,30 @@ int main(int argc, char ** argv) {
     // target model sampling context (reuse the llama_context's sampling instance)
     struct common_sampler * smpl = common_sampler_init(model_tgt, params.sampling);
 
+    // Optional wider draft distribution for deterministic tree verification. The
+    // target sampler remains unchanged (e.g. temp=0 greedy), while this sampler is
+    // kept in lockstep with emitted target tokens and cloned to seed each draft tree.
+    // This lets a greedy target verify alternative draft branches instead of having
+    // temp=0 collapse every draft probability except the argmax to zero.
+    common_params_sampling sampling_dft = params.sampling;
+    if (const char * value = std::getenv("LLAMA_SPEC_TREE_DRAFT_TEMP")) {
+        char * end = nullptr;
+        const float temp = std::strtof(value, &end);
+        if (end == value || *end != '\0' || temp <= 0.0f) {
+            LOG_ERR("invalid LLAMA_SPEC_TREE_DRAFT_TEMP: '%s' (expected a positive number)\n", value);
+            return 1;
+        }
+        sampling_dft.temp = temp;
+        LOG_INF("tree draft sampler temp = %.3f (target temp = %.3f)\n", sampling_dft.temp, params.sampling.temp);
+    }
+    struct common_sampler * smpl_dft_base = common_sampler_init(model_dft, sampling_dft);
+
     // draft sequence data
     std::vector<seq_draft> drafts(n_seq_dft);
 
     for (int s = 0; s < n_seq_dft; ++s) {
         // allocate llama_sampler for each draft sequence
-        drafts[s].smpl = common_sampler_init(model_dft, params.sampling);
+        drafts[s].smpl = common_sampler_init(model_dft, sampling_dft);
     }
 
     llama_batch batch_dft = llama_batch_init(llama_n_batch(ctx_dft), 0, 1);
@@ -233,6 +274,8 @@ int main(int argc, char ** argv) {
     drafts[0].i_batch_tgt[0] = 0;
 
     while (true) {
+        ++n_cycles;
+
         std::set<int> active_seqs = {};
 
         // print current draft sequences
@@ -254,6 +297,7 @@ int main(int argc, char ** argv) {
         std::string token_str;
 
         // loop until we fail to accept a drafted token or we run out of drafted tokens
+        const auto t_accept_start = timing_now();
         while (true) {
 
             // check if the target token matches any of the drafts
@@ -413,6 +457,10 @@ int main(int argc, char ** argv) {
                     }
                 }
 
+                // Mirror every emitted target token into the draft-tree seed sampler
+                // so repetition penalties and other history-dependent filters match.
+                common_sampler_accept(smpl_dft_base, token_id, true);
+
                 if (llama_vocab_is_eog(vocab_tgt, token_id)) {
                     has_eos = true;
                 }
@@ -436,8 +484,10 @@ int main(int argc, char ** argv) {
                 }
             }
         }
+        t_accept_us += timing_now() - t_accept_start;
 
         {
+            const auto t_reconcile_start = timing_now();
             LOG_DBG("the sampled target token (%d, '%s') did not match, or we ran out of drafted tokens\n", token_id, token_str.c_str());
 
             // TODO: simplify
@@ -469,8 +519,14 @@ int main(int argc, char ** argv) {
             common_batch_add  (batch_dft, token_id, n_past_dft, { 0 }, true);
 
             llama_memory_seq_rm(mem_dft, 0, n_past_dft, -1);
+            t_reconcile_us += timing_now() - t_reconcile_start;
+
             // LOG_DBG("dft batch: %s\n", LOG_BATCH_TOSTR_PRETTY(ctx_dft, batch_dft).c_str());
+            const auto t_draft_seed_start = timing_now();
             llama_decode(ctx_dft, batch_dft);
+            t_draft_seed_decode_us += timing_now() - t_draft_seed_start;
+            n_draft_batch_tokens += batch_dft.n_tokens;
+            ++n_draft_calls;
 
             ++n_past_dft;
         }
@@ -479,10 +535,12 @@ int main(int argc, char ** argv) {
             break;
         }
 
+        const auto t_tree_start = timing_now();
+
         if (drafts[0].smpl) {
             common_sampler_free(drafts[0].smpl);
         }
-        drafts[0].smpl = common_sampler_clone(smpl);
+        drafts[0].smpl = common_sampler_clone(smpl_dft_base);
 
         int n_seq_cur  = 1;
         int n_past_cur = n_past_dft;
@@ -598,7 +656,11 @@ int main(int argc, char ** argv) {
             }
 
             // evaluate the drafted tokens on the draft model
+            const auto t_tree_decode_start = timing_now();
             llama_decode(ctx_dft, batch_dft);
+            t_tree_decode_us += timing_now() - t_tree_decode_start;
+            n_draft_batch_tokens += batch_dft.n_tokens;
+            ++n_draft_calls;
             ++n_past_cur;
             ++n_drafted;
 
@@ -606,20 +668,61 @@ int main(int argc, char ** argv) {
                 break;
             }
         }
+        // TT floating tensors pay for a full 32-row tile even when the compact
+        // verifier tree contains only 11 or 12 logical rows. Optionally expand
+        // the tree to a stable [sequence, draft-position] rectangle. Shared
+        // prefix tokens are recomputed independently per sequence, and unused
+        // future positions are filled with ignored causal padding. This keeps
+        // every target graph topology identical so Metal trace can be reused.
+        if (rectangular_target) {
+            const int rows_per_seq = n_draft + 1;
+            GGML_ASSERT((uint64_t) rows_per_seq * (uint64_t) n_seq_dft <=
+                    (uint64_t) llama_n_batch(ctx_tgt));
+            GGML_ASSERT(!drafts[0].tokens.empty());
+
+            const llama_token fallback_token = drafts[0].tokens.front();
+            common_batch_clear(batch_tgt);
+
+            for (int s = 0; s < n_seq_dft; ++s) {
+                const int n_real = drafts[s].active ? (int) drafts[s].tokens.size() : 0;
+                GGML_ASSERT(n_real <= rows_per_seq);
+                GGML_ASSERT(n_real == 0 || (int) drafts[s].i_batch_tgt.size() >= n_real);
+
+                const llama_token pad_token = n_real > 0 ? drafts[s].tokens.back() : fallback_token;
+                for (int i = 0; i < rows_per_seq; ++i) {
+                    llama_token id = pad_token;
+                    if (i < n_real) {
+                        id = drafts[s].tokens[i];
+                        drafts[s].i_batch_tgt[i] = batch_tgt.n_tokens;
+                    } else {
+                        ++n_target_padding_tokens;
+                    }
+                    common_batch_add(batch_tgt, id, n_past_tgt + i, { s }, true);
+                }
+            }
+        }
+        t_tree_total_us += timing_now() - t_tree_start;
 
         // evaluate the target model on the drafted tokens
         {
+            const auto t_target_prepare_start = timing_now();
             llama_memory_seq_keep(mem_tgt, 0);
             for (int s = 1; s < n_seq_dft; ++s) {
                 llama_memory_seq_cp(mem_tgt, 0, s, -1, -1);
             }
+            t_target_prepare_us += timing_now() - t_target_prepare_start;
 
             // LOG_DBG("target batch: %s\n", LOG_BATCH_TOSTR_PRETTY(ctx_tgt, batch_tgt).c_str());
+            const auto t_target_decode_start = timing_now();
             llama_decode(ctx_tgt, batch_tgt);
+            t_target_decode_us += timing_now() - t_target_decode_start;
+            n_target_batch_tokens += batch_tgt.n_tokens;
+            ++n_target_calls;
             ++n_past_tgt;
         }
 
         // the first token is always proposed by the target model before the speculation loop so we erase it here
+        const auto t_post_target_start = timing_now();
         for (int s = 0; s < n_seq_dft; ++s) {
             if (!drafts[s].active) {
                 continue;
@@ -628,6 +731,7 @@ int main(int argc, char ** argv) {
             drafts[s].tokens.erase(drafts[s].tokens.begin());
             drafts[s].dists.erase(drafts[s].dists.begin());
         }
+        t_post_target_us += timing_now() - t_post_target_start;
     }
 
     auto t_dec_end = ggml_time_us();
@@ -644,6 +748,37 @@ int main(int argc, char ** argv) {
     LOG_INF("n_accept  = %d\n", n_accept);
     LOG_INF("accept    = %.3f%%\n", 100.0f * n_accept / n_drafted);
 
+    if (detail_timing) {
+        const int64_t t_total_us = t_dec_end - t_dec_start;
+        const int64_t t_tree_cpu_us = t_tree_total_us - t_tree_decode_us;
+        const int64_t t_measured_us =
+                t_accept_us + t_reconcile_us + t_draft_seed_decode_us +
+                t_tree_total_us + t_target_prepare_us + t_target_decode_us +
+                t_post_target_us;
+        const int64_t t_residual_us = t_total_us - t_measured_us;
+        const auto pct = [t_total_us](int64_t value) {
+            return t_total_us > 0 ? 100.0 * value / t_total_us : 0.0;
+        };
+
+        LOG_INF("\n");
+        LOG_INF("spec timing: cycles=%d target_calls=%d target_batch_tokens=%lld draft_calls=%d draft_batch_tokens=%lld\n",
+                n_cycles, n_target_calls, (long long) n_target_batch_tokens,
+                n_draft_calls, (long long) n_draft_batch_tokens);
+        if (rectangular_target) {
+            LOG_INF("spec timing: rectangular target padding = %lld tokens (%d rows/sequence)\n",
+                    (long long) n_target_padding_tokens, n_draft + 1);
+        }
+        LOG_INF("spec timing: accept/sample/output = %8.3f ms (%5.1f%%)\n", t_accept_us / 1e3, pct(t_accept_us));
+        LOG_INF("spec timing: reconcile/seed prep   = %8.3f ms (%5.1f%%)\n", t_reconcile_us / 1e3, pct(t_reconcile_us));
+        LOG_INF("spec timing: draft seed decode     = %8.3f ms (%5.1f%%)\n", t_draft_seed_decode_us / 1e3, pct(t_draft_seed_decode_us));
+        LOG_INF("spec timing: tree CPU/bookkeeping  = %8.3f ms (%5.1f%%)\n", t_tree_cpu_us / 1e3, pct(t_tree_cpu_us));
+        LOG_INF("spec timing: tree draft decode     = %8.3f ms (%5.1f%%)\n", t_tree_decode_us / 1e3, pct(t_tree_decode_us));
+        LOG_INF("spec timing: target KV prepare     = %8.3f ms (%5.1f%%)\n", t_target_prepare_us / 1e3, pct(t_target_prepare_us));
+        LOG_INF("spec timing: target decode         = %8.3f ms (%5.1f%%)\n", t_target_decode_us / 1e3, pct(t_target_decode_us));
+        LOG_INF("spec timing: post-target cleanup   = %8.3f ms (%5.1f%%)\n", t_post_target_us / 1e3, pct(t_post_target_us));
+        LOG_INF("spec timing: residual              = %8.3f ms (%5.1f%%)\n", t_residual_us / 1e3, pct(t_residual_us));
+    }
+
     LOG_INF("\n");
     LOG_INF("draft:\n\n");
     // TODO: print sampling/grammar timings for all drafts
@@ -654,6 +789,7 @@ int main(int argc, char ** argv) {
     common_perf_print(ctx_tgt, smpl);
 
     common_sampler_free(smpl);
+    common_sampler_free(smpl_dft_base);
     for (int s = 0; s < n_seq_dft; ++s) {
         common_sampler_free(drafts[s].smpl);
     }

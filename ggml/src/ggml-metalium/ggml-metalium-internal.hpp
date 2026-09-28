@@ -4,9 +4,12 @@
 // These are the few types and helpers the lowering dispatch needs to bridge ggml
 // tensors and TTNN tensors; everything else stays private to ggml-metalium.cpp.
 
+#include <array>
 #include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 #include <ttnn/tensor/tensor.hpp>
 #include <ttnn/device.hpp>
@@ -29,6 +32,11 @@ struct ggml_tensor_extra_metalium {
     std::optional<tt::tt_metal::MemoryConfig> memory_config;
     // Host shadow for dynamic scalar indices; lets KV updates use TTNN update_cache without a readback.
     std::optional<int32_t> host_i32_scalar;
+    // Small dynamic inputs retained only for opt-in cache fast paths. Integer rows
+    // carry KV update positions; floating rows carry the additive attention mask.
+    std::vector<int32_t> host_i32_values;
+    std::vector<float> host_f32_values;
+    std::array<int64_t, GGML_MAX_DIMS> host_f32_shape{};
 
     // M3 dual-ASIC: true when this tensor was sharded across the mesh at upload
     // (column-parallel weight shard along GGML ne1). This tt-metal build reports
@@ -61,6 +69,14 @@ struct ggml_backend_metalium_context {
     std::string name;
     std::unique_ptr<MetaliumGraphCompiler> compiler;
     MetaliumBackendRuntime * runtime = nullptr;
+
+    // Last cache-tail update observed on this backend. Ordinary single-sequence
+    // DFlash writes K and V immediately before attention with identical indices.
+    std::vector<int32_t> last_k_indices;
+    std::vector<int32_t> last_v_indices;
+    // Identity page tables are immutable and shared by every layer with the same
+    // active padded KV length.
+    std::unordered_map<uint32_t, std::shared_ptr<ttnn::Tensor>> kv_identity_page_tables;
 };
 
 // Materialises the TTNN tensor backing a (possibly lazily-viewed) ggml tensor.

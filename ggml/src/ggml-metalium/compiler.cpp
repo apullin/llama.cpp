@@ -1482,6 +1482,21 @@ ActLowering::match(ggml_tensor * u, const FusionFacts & facts) const {
     for (const Pat * pattern : forms) {
         if (auto r = match_site<ActLowering::Site>(*pattern, u)) {
             ActLowering::Site site = std::move(r->site);
+            // Attention-gate weights may live on the peer ASIC. Keep their raw matmul
+            // visible so prompt graphs can use the backend's cross-device matmul path
+            // and single-token graphs can fold it into the QKV/gate overlap executor.
+            // Absorbing the matmul here would both recompute the decode result and try
+            // to execute a local activation against a remote weight.
+            static const bool internal_attn_gate_parallel =
+                getenv("GGML_METALIUM_INTERNAL_ATTN_GATE_PARALLEL") != nullptr &&
+                getenv("GGML_METALIUM_FABRIC_COPY") != nullptr;
+            const std::string_view weight_name(site.weight->name);
+            const bool local_attn_gate = weight_name == "blk.25.attn_gate.weight" ||
+                weight_name == "blk.26.attn_gate.weight";
+            if (internal_attn_gate_parallel && !local_attn_gate &&
+                weight_name.ends_with(".attn_gate.weight")) {
+                return std::nullopt;
+            }
             if (is_rwkv_width_sharded_mlp_weight(site.weight)) {
                 return std::nullopt;
             }
