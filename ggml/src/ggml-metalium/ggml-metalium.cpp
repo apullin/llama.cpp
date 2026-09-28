@@ -5188,7 +5188,8 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
     GGML_UNUSED(backend);
 }
 
-static void ggml_backend_metalium_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph) {
+static void ggml_backend_metalium_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+    GGML_UNUSED(params);
     if(!g_debug_flags.release_activations) {
         return;
     }
