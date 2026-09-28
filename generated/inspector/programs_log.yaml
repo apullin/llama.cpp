@@ -1,0 +1,74 @@
+- program_created:
+    id: 0
+    timestamp_ns: 1786859722886474073
+- program_compile_started:
+    id: 0
+    timestamp_ns: 1786859722886939762
+- program_kernel_compile_finished:
+    id: 0
+    timestamp_ns: 1786859722888954877
+    duration_ns: 2015115
+    watcher_kernel_id: 3
+    name: cq_dispatch_subordinate
+    path: /home/pullin/.cache/tt-metal-cache/13988729322277029510/kernels/cq_dispatch_subordinate/486199294080063598/
+    source: tt_metal/impl/dispatch/kernels/cq_dispatch_subordinate.cpp
+- program_kernel_compile_finished:
+    id: 0
+    timestamp_ns: 1786859722889917643
+    duration_ns: 2977881
+    watcher_kernel_id: 4
+    name: cq_dispatch_subordinate_compute
+    path: /home/pullin/.cache/tt-metal-cache/13988729322277029510/kernels/cq_dispatch_subordinate_compute/6112898495205831238/
+    source: tt_metal/impl/dispatch/kernels/cq_dispatch_subordinate_compute.cpp
+- program_kernel_compile_finished:
+    id: 0
+    timestamp_ns: 1786859722889969571
+    duration_ns: 3029809
+    watcher_kernel_id: 2
+    name: cq_dispatch
+    path: /home/pullin/.cache/tt-metal-cache/13988729322277029510/kernels/cq_dispatch/894318195965785866/
+    source: tt_metal/impl/dispatch/kernels/cq_dispatch.cpp
+- program_kernel_compile_finished:
+    id: 0
+    timestamp_ns: 1786859722890869522
+    duration_ns: 3929760
+    watcher_kernel_id: 1
+    name: cq_prefetch
+    path: /home/pullin/.cache/tt-metal-cache/13988729322277029510/kernels/cq_prefetch/3533790982717285995/
+    source: tt_metal/impl/dispatch/kernels/cq_prefetch.cpp
+- program_compile_finished:
+    id: 0
+    timestamp_ns: 1786859722890889361
+    duration_ns: 3949599
+- program_created:
+    id: 1
+    timestamp_ns: 1786859722903578741
+- program_compile_started:
+    id: 1
+    timestamp_ns: 1786859722903635336
+- program_kernel_compile_finished:
+    id: 1
+    timestamp_ns: 1786859722904654536
+    duration_ns: 1019200
+    watcher_kernel_id: 6
+    name: cq_realtime_profiler_push
+    path: /home/pullin/.cache/tt-metal-cache/13988729322277029510/kernels/cq_realtime_profiler_push/7378975850573718698/
+    source: tt_metal/impl/dispatch/kernels/cq_realtime_profiler_push.cpp
+- program_kernel_compile_finished:
+    id: 1
+    timestamp_ns: 1786859722905041768
+    duration_ns: 1406432
+    watcher_kernel_id: 5
+    name: cq_realtime_profiler
+    path: /home/pullin/.cache/tt-metal-cache/13988729322277029510/kernels/cq_realtime_profiler/16225348465631427867/
+    source: tt_metal/impl/dispatch/kernels/cq_realtime_profiler.cpp
+- program_compile_finished:
+    id: 1
+    timestamp_ns: 1786859722905053906
+    duration_ns: 1418570
+- program_destroyed:
+    id: 1
+    timestamp_ns: 1786859723636410919
+- program_destroyed:
+    id: 0
+    timestamp_ns: 1786859723637571722

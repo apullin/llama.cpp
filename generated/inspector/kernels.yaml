@@ -1,0 +1,36 @@
+- kernel:
+    watcher_kernel_id: 3
+    name: cq_dispatch_subordinate
+    path: /home/pullin/.cache/tt-metal-cache/13988729322277029510/kernels/cq_dispatch_subordinate/486199294080063598/
+    source: tt_metal/impl/dispatch/kernels/cq_dispatch_subordinate.cpp
+    program_id: 0
+- kernel:
+    watcher_kernel_id: 4
+    name: cq_dispatch_subordinate_compute
+    path: /home/pullin/.cache/tt-metal-cache/13988729322277029510/kernels/cq_dispatch_subordinate_compute/6112898495205831238/
+    source: tt_metal/impl/dispatch/kernels/cq_dispatch_subordinate_compute.cpp
+    program_id: 0
+- kernel:
+    watcher_kernel_id: 2
+    name: cq_dispatch
+    path: /home/pullin/.cache/tt-metal-cache/13988729322277029510/kernels/cq_dispatch/894318195965785866/
+    source: tt_metal/impl/dispatch/kernels/cq_dispatch.cpp
+    program_id: 0
+- kernel:
+    watcher_kernel_id: 1
+    name: cq_prefetch
+    path: /home/pullin/.cache/tt-metal-cache/13988729322277029510/kernels/cq_prefetch/3533790982717285995/
+    source: tt_metal/impl/dispatch/kernels/cq_prefetch.cpp
+    program_id: 0
+- kernel:
+    watcher_kernel_id: 6
+    name: cq_realtime_profiler_push
+    path: /home/pullin/.cache/tt-metal-cache/13988729322277029510/kernels/cq_realtime_profiler_push/7378975850573718698/
+    source: tt_metal/impl/dispatch/kernels/cq_realtime_profiler_push.cpp
+    program_id: 1
+- kernel:
+    watcher_kernel_id: 5
+    name: cq_realtime_profiler
+    path: /home/pullin/.cache/tt-metal-cache/13988729322277029510/kernels/cq_realtime_profiler/16225348465631427867/
+    source: tt_metal/impl/dispatch/kernels/cq_realtime_profiler.cpp
+    program_id: 1

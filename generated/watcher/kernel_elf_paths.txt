@@ -1,0 +1,7 @@
+0: blank
+3: /home/pullin/.cache/tt-metal-cache/13988729322277029510/kernels/cq_dispatch_subordinate/486199294080063598//ncrisc/ncrisc.elf
+4: /home/pullin/.cache/tt-metal-cache/13988729322277029510/kernels/cq_dispatch_subordinate_compute/6112898495205831238//trisc0/trisc0.elf:/home/pullin/.cache/tt-metal-cache/13988729322277029510/kernels/cq_dispatch_subordinate_compute/6112898495205831238//trisc1/trisc1.elf:/home/pullin/.cache/tt-metal-cache/13988729322277029510/kernels/cq_dispatch_subordinate_compute/6112898495205831238//trisc2/trisc2.elf
+2: /home/pullin/.cache/tt-metal-cache/13988729322277029510/kernels/cq_dispatch/894318195965785866//brisc/brisc.elf
+1: /home/pullin/.cache/tt-metal-cache/13988729322277029510/kernels/cq_prefetch/3533790982717285995//brisc/brisc.elf
+6: /home/pullin/.cache/tt-metal-cache/13988729322277029510/kernels/cq_realtime_profiler_push/7378975850573718698//ncrisc/ncrisc.elf
+5: /home/pullin/.cache/tt-metal-cache/13988729322277029510/kernels/cq_realtime_profiler/16225348465631427867//brisc/brisc.elf

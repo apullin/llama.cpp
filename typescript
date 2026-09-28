@@ -1,0 +1,5 @@
+Script started on 2026-08-12 19:04:26-07:00 [COMMAND="prime-agent --offline --autonomous   --autonomous-max-turns 30   --autonomous-max-tokens 400000   --autonomous-timeout-ms 6900000   --provider peri-local --model muse-glimmer-30b   --cwd /home/pullin/personal/serving/llama-upstream   -r 019ff8d1-086e-7584-97e5-689a7db83224   'Continue. The previous driver was interrupted. Resume milestone M1: run the llama-bench baseline per TT-DEV-BRIEF.md.'" <not executed on terminal>]
+Error: No session found matching '019ff8d1-086e-7584-97e5-689a7db83224'.
+Open prime-agent and press left-arrow to browse sessions.
+
+Script done on 2026-08-12 19:04:27-07:00 [COMMAND_EXIT_CODE="1"]
