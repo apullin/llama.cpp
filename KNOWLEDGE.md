@@ -33,10 +33,10 @@
 - all_gather after matmul when weight sharded
 
 ## Gotchas
-- distribute_tensor expects host tensor, not device. Must distribute before to_device, then tilize.
-- Shape equality assertions fail for sharded tensors (logical shape halved). Relaxed checks in buffer_set_tensor and realize_ggml_view.
-- realize_ggml_view shape check disabled for M3 to avoid false abort.
-- Mesh buffer global_layout check for sharded detection: device_storage().get_mesh_buffer().global_layout() != REPLICATED
+- distribute_tensor expects a host tensor, not a device tensor. Distribute before to_device, then tilize.
+- A sharded weight and `[K,N]` storage can intentionally have a non-canonical physical shape. Only those storage-boundary checks are relaxed; computed output and buffer_get_tensor shape assertions stay enabled.
+- Use `ggml_tensor_extra_metalium::m3_sharded` on the GGML weight tensor (`src0`) as the gather predicate. Do not infer sharding from the activation or a transient TTNN layout.
+- The original `[202048,1,1,1]` versus `[101024,1,1,1]` mismatch was a missing post-matmul gather, not a reason to disable output shape assertions.
 
 ## Hardware
 - N300 = 2 Wormhole ASICs, 12GB each, 24GB total
@@ -48,9 +48,8 @@
 - llama-cli --temp 0 fixed prompt must match token-for-token single-ASIC
 - llama-bench -ngl99 must fit and run on 1x2 mesh
 
-## 2026-08-12 Mesh shape mismatch
-- Symptom: MUL_MAT node shape mismatch on 1x2 mesh: GGML wants [202048,1,1,1], TTNN generates Shape([1,1,1,101024])
-- Occurs even with sharding disabled, -ngl 1
-- -ngl 0 works fine on mesh
-- Hypothesis: ttnn::matmul on MeshDevice returns sharded output or backend reports logical shape halved
-- Workaround: strict shape checks disabled for mesh to unblock progress
+## 2026-08-12 Mesh shape mismatch (resolved)
+- Symptom was MUL_MAT output width `101024` when GGML required `202048` on the 1x2 mesh.
+- Root cause was a missing gather caused by inspecting the wrong tensor for sharding.
+- Current code records `m3_sharded` on weight metadata and calls `ggml_metalium_m3_gather(out, src0)`.
+- Output and buffer_get_tensor shape assertions are enabled. See `SUPERSEDED.md` for the discarded hypotheses and temporary assertion workarounds.
