@@ -5709,10 +5709,15 @@ static void ggml_metalium_close_all_devices() {
         fprintf(stderr, "[metalium-fabric-copy] direct=%llu fallback=%llu\n",
             (unsigned long long)fabric_copies, (unsigned long long)fabric_fallbacks);
     }
-    for (auto& dev : g_metalium_open_devices) {
-        if (dev) {
+    // Close in reverse open order: submeshes before their parent. Each submesh shares the parent's
+    // device scope, and tt-metal only runs DeviceManager::close_devices (which stops the fabric
+    // routers and dispatch kernels) once the last holder of that scope has closed. Closing only
+    // the parent leaves the routers running on the ETH link cores after exit, and the next open
+    // fails the 50 ms ETH heartbeat check.
+    for (auto it = g_metalium_open_devices.rbegin(); it != g_metalium_open_devices.rend(); ++it) {
+        if (*it) {
             try {
-                ttnn::close_device(*dev);
+                ttnn::close_device(**it);
             }
             catch (...) {
                 // We are at process teardown; nothing useful to do with an exception here.
@@ -5818,9 +5823,7 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_metalium_reg()
         else {
             device = ttnn::distributed::open_mesh_device(mesh_shape, DEFAULT_L1_SMALL_SIZE, trace_region_size, 2, tt::tt_metal::DispatchCoreType::ETH);
         }
-        if(parent_mesh == nullptr) {
-            g_metalium_open_devices.push_back(device);
-        }
+        g_metalium_open_devices.push_back(device);
         std::atexit(ggml_metalium_close_all_devices); // track and kill on eexit
         if(!g_debug_flags.disable_program_cache) {
             ttnn::enable_program_cache(*device);

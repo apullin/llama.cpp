@@ -194,3 +194,16 @@ keys sanitized but junk names remain junk).
 - Full v0.79 Glimmer offload from the staged compatibility patch exited 0 and repeated the prior v0.79 continuation. The warm non-traced run reached 3.88 tok/s, reported 346/348 JIT hits, and used 2,205 direct fabric copies with zero fallback.
 - The full-offload continuation changes after several tokens between v0.74 and v0.79, but repeats exactly within v0.79. Keep runtime-version results separate and require same-runtime controls for optimization gates.
 - Switching directly from v0.79 to v0.74 left incompatible fabric firmware state and timed out during router sync. One scoped N300 reset restored a clean v0.74 run.
+
+## 2026-09-28 Fabric teardown at exit (ETH heartbeat failures)
+
+- **Symptom:** after a clean exit, the next open intermittently failed in UMD topology discovery with "Timed out waiting for ETH heartbeat ... e1-6" (local chip) or "... e1-0" (remote chip). Two of three re-opens failed on 2026-09-28.
+- **Cause:**
+  - The backend closed only the 2x1 parent mesh. The per-ASIC submeshes share its `ScopedDevices`, so `DeviceManager::close_devices` never ran. gdb saw only `MetalContext::teardown`, at static destruction.
+  - The fabric routers therefore stayed `READY_FOR_TRAFFIC` on link cores L ch8/ch9 and R ch0/ch1.
+  - The second-link workload router (`GGML_METALIUM_FABRIC_COPY=1`) yields to base firmware only about every 64 ms because of the default 10,000-iteration switch interval. That is longer than UMD's 50 ms heartbeat window.
+- **Fix:** close submeshes before the parent at exit. Evidence after the fix:
+  - gdb shows `DeviceManager::close_devices` and `FabricFirmwareInitializer::teardown` running.
+  - All four link routers report `TERMINATED`, and heartbeat gaps stay under 0.4 ms.
+  - Three N300 benchmark servers (DFlash, DFlash, Glimmer) and two staged-build completions re-opened back to back without a reset. The completions repeated the v0.79 continuation.
+  - The staged patch builds against v0.74 and v0.79.
