@@ -18,6 +18,7 @@
 
 
 using namespace tt::tt_metal;
+using ttnn::Tensor;
 
 namespace {
 
@@ -36,7 +37,7 @@ struct SoftMaxDeviceOperation {
         std::optional<Tensor> mask;
     };
 
-    using spec_return_value_t = ttnn::TensorSpec;
+    using spec_return_value_t = tt::tt_metal::TensorSpec;
     using tensor_return_value_t = Tensor;
 
     struct SoftMaxProgramFactory {
@@ -101,7 +102,7 @@ SoftMaxDeviceOperation::spec_return_value_t SoftMaxDeviceOperation::compute_outp
 SoftMaxDeviceOperation::tensor_return_value_t SoftMaxDeviceOperation::create_output_tensors(
     const operation_attributes_t& attrs, const tensor_args_t& tensor_args) {
     auto spec = compute_output_specs(attrs, tensor_args);
-    return create_device_tensor(spec, tensor_args.input.device());
+    return metalium_create_device_tensor(spec, tensor_args.input.device());
 }
 
 SoftMaxDeviceOperation::SoftMaxProgramFactory::cached_program_t

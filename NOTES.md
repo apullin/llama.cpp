@@ -184,3 +184,13 @@ keys sanitized but junk names remain junk).
   weights+KV; the 20MB [512,19968] FFN intermediate doesn't fit). pp64
   fine. Predates the [K,N] change (no memory delta). Mitigations: fewer
   ngl, activation release scheduling, smaller ubatch.
+
+## 2026-09-28 TT-Metal v0.79 compatibility
+
+- Added source compatibility for pinned TT-Metal `13adda80` and official stable `v0.79.0` (`de546d3b14`). Both Metalium builds complete with `-j 64`.
+- Ported tensor namespace changes, host-storage access, device-tensor creation, SFPI conversions, and explicit v0.79 link dependencies without changing the v0.74 runtime path.
+- Clean v0.74 1x2 `-ngl 1` smoke exited 0, produced the CPU continuation byte-for-byte, reached 9.10 tok/s, and reported 74/74 JIT hits.
+- Clean v0.79 1x2 `-ngl 1` smoke passed twice with the same CPU continuation. The warm run reached 9.44 tok/s with 83/83 JIT hits.
+- Full v0.79 Glimmer offload from the staged compatibility patch exited 0 and repeated the prior v0.79 continuation. The warm non-traced run reached 3.88 tok/s, reported 346/348 JIT hits, and used 2,205 direct fabric copies with zero fallback.
+- The full-offload continuation changes after several tokens between v0.74 and v0.79, but repeats exactly within v0.79. Keep runtime-version results separate and require same-runtime controls for optimization gates.
+- Switching directly from v0.79 to v0.74 left incompatible fabric firmware state and timed out during router sync. One scoped N300 reset restored a clean v0.74 run.

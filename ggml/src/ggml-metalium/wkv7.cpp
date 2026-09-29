@@ -69,14 +69,14 @@ wkv7_device::RWKVWKV7DeviceOperation::create_output_tensors(
     const tensor_args_t& tensor_args)
 {
     auto spec = compute_output_specs(a, tensor_args);
-    return create_device_tensor(spec, tensor_args.r.device());
+    return metalium_create_device_tensor(spec, tensor_args.r.device());
 }
 
 void wkv7_device::RWKVWKV7DeviceOperation::validate_on_program_cache_miss(
     const operation_attributes_t& a,
     const tensor_args_t& t)
 {
-    TT_FATAL(t.r.storage_type() == tt::tt_metal::StorageType::DEVICE, "WKV7 inputs must be on device");
+    TT_FATAL(t.r.storage_type() == ttnn::StorageType::DEVICE, "WKV7 inputs must be on device");
     TT_FATAL(t.r.layout() == tt::tt_metal::Layout::TILE, "WKV7 inputs must be TILE layout");
     TT_FATAL(a.S == 64, "WKV7 metalium kernel currently requires head_size == 64, got {}", a.S);
     TT_FATAL(a.S % a.H == 0, "WKV7 requires head_count | head_size (got H={}, S={})", a.H, a.S);

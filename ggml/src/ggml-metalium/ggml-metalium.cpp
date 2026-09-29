@@ -1,4 +1,8 @@
-#include "build_Release/include/tt-metalium/experimental/tensor/tensor_types.hpp"
+#if __has_include(<tt-metalium/tensor/tensor_types.hpp>)
+#include <tt-metalium/tensor/tensor_types.hpp>
+#else
+#include <tt-metalium/experimental/tensor/tensor_types.hpp>
+#endif
 #include "fmt/base.h"
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
@@ -9,6 +13,7 @@
 
 #include "ggml-metalium-internal.hpp"
 #include "compiler.hpp"
+#include "utils.hpp"
 
 #include "hostdevcommon/common_values.hpp"
 #include "tt-metalium/bfloat16.hpp"
@@ -602,12 +607,12 @@ static void copy_tt_tensor_to_host_pointer(const ttnn::Tensor& tensor, void* dst
     else {
        row_major_tensor = tensor.cpu();
     }
-    GGML_ASSERT(row_major_tensor.storage_type() == tt::tt_metal::StorageType::HOST);
+    GGML_ASSERT(row_major_tensor.storage_type() == ttnn::StorageType::HOST);
     GGML_ASSERT(row_major_tensor.layout() == ttnn::ROW_MAJOR_LAYOUT);
 
 
     // Grab the data held in the TT tensor
-    const tt::tt_metal::HostStorage& storage = row_major_tensor.host_storage();
+    const auto& storage = row_major_tensor.host_storage();
     const auto buffer = storage.buffer().get_shard({0, 0}).value();
     auto view = buffer.view_as<SrcType>();
     const SrcType* buf = &view[0];
@@ -823,8 +828,8 @@ void ggml_metalium_store_tensor(ggml_tensor_extra_metalium* meta, ttnn::Tensor v
     meta->row_folded.reset();
     if(cur != nullptr
         && !g_metalium_trace_capturing
-        && cur->storage_type()  == tt::tt_metal::StorageType::DEVICE
-        && value.storage_type() == tt::tt_metal::StorageType::DEVICE
+        && cur->storage_type()  == ttnn::StorageType::DEVICE
+        && value.storage_type() == ttnn::StorageType::DEVICE
         && cur->dtype()         == value.dtype()
         && cur->layout()        == value.layout()
         && cur->logical_shape() == value.logical_shape()) {
@@ -871,7 +876,7 @@ static bool ggml_metalium_can_narrow_dram_interleaved(
         uint32_t dim,
         uint32_t start,
         uint32_t length) {
-    if(tensor.storage_type() != tt::tt_metal::StorageType::DEVICE) {
+    if(tensor.storage_type() != ttnn::StorageType::DEVICE) {
         return false;
     }
     if(tensor.memory_config().buffer_type() != tt::tt_metal::BufferType::DRAM ||
@@ -1382,7 +1387,7 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
     else {
         GGML_ABORT("unsupported Metalium MUL_MAT shape");
     }
-    GGML_ASSERT(dst_meta->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE);
+    GGML_ASSERT(dst_meta->tensor->storage_type() == ttnn::StorageType::DEVICE);
 }
 
 // Walk view_src to the storage leaf; return its extra iff that leaf is row-folded, else nullptr.
@@ -3297,7 +3302,7 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
         GGML_ASSERT(!permute.has_value() && "Cannot permute tensor without tilizing");
     }
 
-    GGML_ASSERT(t.storage_type() == tt::tt_metal::StorageType::DEVICE);
+    GGML_ASSERT(t.storage_type() == ttnn::StorageType::DEVICE);
     GGML_ASSERT(t.dtype() == final_type);
     // Skip shape equality check for sharded (distributed) and [K,N]-stored tensors
     if (!should_shard && !weight_kn) {
@@ -3533,7 +3538,7 @@ ggml_backend_metalium_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
         }
 
         g_metalium_fabric_copy_count.fetch_add(1, std::memory_order_relaxed);
-        auto ret = tt::tt_metal::create_device_tensor(src_tensor.tensor_spec(), bufctx->device.get());
+        auto ret = metalium_create_device_tensor(src_tensor.tensor_spec(), bufctx->device.get());
         ttnn::experimental::send_async(src_tensor, *send_socket);
         ttnn::experimental::recv_async(ret, *recv_socket);
         ggml_metalium_store_tensor(dst_meta, std::move(ret));
@@ -3541,7 +3546,7 @@ ggml_backend_metalium_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
     }
 
     ttnn::Tensor ret = ttnn::identity(src_tensor);
-    GGML_ASSERT(ret.storage_type() == tt::tt_metal::StorageType::DEVICE);
+    GGML_ASSERT(ret.storage_type() == ttnn::StorageType::DEVICE);
     ggml_metalium_store_tensor(dst_meta, std::move(ret));
     return true;
 }
@@ -3779,7 +3784,7 @@ static void ggml_metalium_trace_mem_report(ttnn::MeshDevice* mesh, MetaliumBacke
 
     std::unordered_set<uint64_t> seen;
     auto buf_bytes = [&](const std::shared_ptr<ttnn::Tensor>& t) -> uint64_t {
-        if(!t || t->storage_type() != tt::tt_metal::StorageType::DEVICE) return 0;
+        if(!t || t->storage_type() != ttnn::StorageType::DEVICE) return 0;
         try {
             uint64_t addr = (uint64_t)t->buffer()->address();
             if(!seen.insert(addr).second) return 0; // already counted this buffer
@@ -3878,9 +3883,9 @@ struct metalium_trace_dispatch {
     static void apply_pin(ggml_tensor* t, const std::shared_ptr<ttnn::Tensor>& anchor) {
         if(t->extra == nullptr) return;
         auto* m = (ggml_tensor_extra_metalium*)t->extra;
-        if(m->tensor == nullptr || m->tensor->storage_type() != tt::tt_metal::StorageType::DEVICE) return;
+        if(m->tensor == nullptr || m->tensor->storage_type() != ttnn::StorageType::DEVICE) return;
         if(m->tensor.get() == anchor.get()) return; // already at the fixed address (also dedups repeats)
-        if(anchor->storage_type() != tt::tt_metal::StorageType::DEVICE
+        if(anchor->storage_type() != ttnn::StorageType::DEVICE
             || m->tensor->dtype()  != anchor->dtype()
             || m->tensor->layout() != anchor->layout()
             || !ggml_tt_tensors_shape_equal(t, *anchor)) {
@@ -3896,7 +3901,7 @@ struct metalium_trace_dispatch {
     void pin_input(ggml_tensor* t, bool may_populate) const {
         if(t->op != GGML_OP_NONE || t->extra == nullptr) return;
         auto* m = (ggml_tensor_extra_metalium*)t->extra;
-        if(m->tensor == nullptr || m->tensor->storage_type() != tt::tt_metal::StorageType::DEVICE) return;
+        if(m->tensor == nullptr || m->tensor->storage_type() != ttnn::StorageType::DEVICE) return;
         auto& pins = runtime->pinned_tensors;
         auto key = GGMLTensorMeta(t);
         auto it = pins.find(key);
@@ -3921,7 +3926,7 @@ struct metalium_trace_dispatch {
                 if(s == nullptr || s->op != GGML_OP_NONE || s->extra == nullptr) continue;
                 if(!seen.insert(s).second) continue;
                 auto* m = (ggml_tensor_extra_metalium*)s->extra;
-                if(m->tensor == nullptr || m->tensor->storage_type() != tt::tt_metal::StorageType::DEVICE) continue;
+                if(m->tensor == nullptr || m->tensor->storage_type() != ttnn::StorageType::DEVICE) continue;
                 auto it = runtime->pinned_tensors.find(GGMLTensorMeta(s));
                 if(it == runtime->pinned_tensors.end()) continue;
                 state->pin_plan.emplace_back(s, it->second);
@@ -4886,7 +4891,7 @@ static bool metalium_execute_ffn_parallel(ggml_backend_metalium_context * ctx, M
     }
     GGML_ASSERT(send_input != nullptr && recv_input != nullptr && send_output != nullptr && recv_output != nullptr);
 
-    auto remote_input = tt::tt_metal::create_device_tensor(input->tensor_spec(), up_weight->device());
+    auto remote_input = metalium_create_device_tensor(input->tensor_spec(), up_weight->device());
     ttnn::experimental::send_async(*input, *send_input);
     ttnn::experimental::recv_async(remote_input, *recv_input);
 
@@ -4897,7 +4902,7 @@ static bool metalium_execute_ffn_parallel(ggml_backend_metalium_context * ctx, M
         ggml_metalium_q1_attn_program_config(group.nodes[1]->src[0], group.nodes[1]->src[1]),
         std::nullopt, make_compute_kernel_config(remote_input.device()));
 
-    auto local_up_out = tt::tt_metal::create_device_tensor(up_out.tensor_spec(), input->device());
+    auto local_up_out = metalium_create_device_tensor(up_out.tensor_spec(), input->device());
     ttnn::experimental::send_async(up_out, *send_output);
 
     auto * gate_meta = static_cast<ggml_tensor_extra_metalium *>(group.nodes[0]->extra);
@@ -5155,7 +5160,7 @@ static enum ggml_status ggml_backend_metalium_graph_compute(ggml_backend_t backe
         // null); its logical shape differs from the ggml node, so skip the canonical post-checks.
         if(!meta->is_row_folded()) {
             GGML_ASSERT(meta->tensor != NULL);
-            GGML_ASSERT(meta->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE);
+            GGML_ASSERT(meta->tensor->storage_type() == ttnn::StorageType::DEVICE);
             if(meta->memory_config.has_value() && meta->tensor->memory_config() != *meta->memory_config) {
                 fmt::println(stderr, "Memory config mismatch for node '{}' ({}): expected {}, got {}",
                     node->name, ggml_op_name(node->op), *meta->memory_config, meta->tensor->memory_config());
@@ -5678,7 +5683,7 @@ static void ggml_metalium_init_fabric_copy_links(
     g_metalium_fabric_device1 = device1;
     const MeshCoordinate coord(0, 0);
     const std::vector<SocketConnection> connections = {
-        SocketConnection(MeshCoreCoord(coord, CoreCoord(0, 0)), MeshCoreCoord(coord, CoreCoord(0, 1)))
+        SocketConnection(MeshCoreCoord(coord, tt::tt_metal::CoreCoord(0, 0)), MeshCoreCoord(coord, tt::tt_metal::CoreCoord(0, 1)))
     };
     const SocketMemoryConfig memory_config(tt::tt_metal::BufferType::L1, 64 * 1024);
     const SocketConfig config(connections, memory_config);

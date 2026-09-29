@@ -66,3 +66,7 @@ Upstream tensor-split and meta-backend changes do not replace the Metalium mesh 
 - Upstream DFlash2 and fused feature injection changed the same `common/speculative.cpp` path, but do not implement the saved alternate verifier tree or `process_path` API. That experiment was retained and ported to upstream's `batch_inject.embd` buffer and M-RoPE position handling.
 - The saved Metalium direct-KV-write, paged-Q alignment, output-copy elision, and dual-ASIC projection work has no upstream Metalium equivalent and remains active work.
 - `ggml-metalium.cpp.orig`, `generated/` inspector output, `test_goal_writeup.md`, and `typescript` are artifacts, not source changes. They remain recoverable in the external pre-rebase snapshot and should not be committed.
+
+## TT-Metal v0.79 supersession
+
+- The external v0.74 UINT32 remainder workaround is not part of the v0.79 port. Official v0.79 includes the relevant UINT32 shift and remainder fixes, including TT-Metal PRs 56682 and 55506. Keep the known-good v0.74 tree unchanged instead of replaying that patch into v0.79.

@@ -31,8 +31,8 @@ SliceWriteFoldedDeviceOperation::select_program_factory(
 
 void SliceWriteFoldedDeviceOperation::validate_on_program_cache_miss(
     const operation_attributes_t& a, const tensor_args_t& t) {
-    TT_FATAL(t.src.storage_type()   == tt::tt_metal::StorageType::DEVICE, "swf: src must be on device");
-    TT_FATAL(t.cache.storage_type() == tt::tt_metal::StorageType::DEVICE, "swf: cache must be on device");
+    TT_FATAL(t.src.storage_type()   == ttnn::StorageType::DEVICE, "swf: src must be on device");
+    TT_FATAL(t.cache.storage_type() == ttnn::StorageType::DEVICE, "swf: cache must be on device");
     TT_FATAL(t.src.layout()   == tt::tt_metal::Layout::TILE, "swf: src must be TILE layout");
     TT_FATAL(t.cache.layout() == tt::tt_metal::Layout::TILE, "swf: cache must be TILE layout");
     TT_FATAL(t.src.dtype()   == tt::tt_metal::DataType::BFLOAT16, "swf: src must be bf16");

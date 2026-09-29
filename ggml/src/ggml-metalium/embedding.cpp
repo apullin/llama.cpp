@@ -11,6 +11,7 @@
 #include <variant>
 
 using namespace tt::tt_metal;
+using ttnn::Tensor;
 
 namespace {
 
@@ -22,7 +23,7 @@ struct EmbeddingFoldDeviceOperation {
     struct tensor_args_t {
         const Tensor& a;
     };
-    using spec_return_value_t = ttnn::TensorSpec;
+    using spec_return_value_t = tt::tt_metal::TensorSpec;
     using tensor_return_value_t = Tensor;
 
     struct ProgramFactory {
@@ -133,7 +134,7 @@ void EmbeddingFoldDeviceOperation::ProgramFactory::override_runtime_arguments(
 struct EmbeddingGatherDeviceOperation {
     struct operation_attributes_t { uint32_t embed; };
     struct tensor_args_t { const Tensor& variant; const Tensor& index; };
-    using spec_return_value_t = ttnn::TensorSpec;
+    using spec_return_value_t = tt::tt_metal::TensorSpec;
     using tensor_return_value_t = Tensor;
 
     struct ProgramFactory {
@@ -167,7 +168,7 @@ struct EmbeddingGatherDeviceOperation {
             ta.variant.memory_config()));
     }
     static tensor_return_value_t create_output_tensors(const operation_attributes_t& attr, const tensor_args_t& ta) {
-        return create_device_tensor(compute_output_specs(attr, ta), ta.variant.device());
+        return metalium_create_device_tensor(compute_output_specs(attr, ta), ta.variant.device());
     }
 };
 

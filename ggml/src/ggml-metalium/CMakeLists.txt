@@ -46,11 +46,20 @@ target_include_directories(ggml-metalium PRIVATE
 target_link_directories(ggml-metalium PRIVATE
     $ENV{TT_METAL_HOME}/build/ttnn
     $ENV{TT_METAL_HOME}/build/tt_metal
+    $ENV{TT_METAL_HOME}/build/lib
+    $ENV{TT_METAL_HOME}/build/tt_stl
+    $ENV{TT_METAL_HOME}/build/tt_metal/third_party/umd/lib
+    $ENV{TT_METAL_HOME}/build/_deps/yaml-cpp-build
 )
+
+target_link_options(ggml-metalium PRIVATE -Wl,--no-as-needed)
 
 target_link_libraries(ggml-metalium PRIVATE
     # Metalium
     tt_metal
+    tt-umd
+    tt_stl
+    tracy
     yaml-cpp
 
     # TTNN

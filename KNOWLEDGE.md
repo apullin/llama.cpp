@@ -53,3 +53,16 @@
 - Root cause was a missing gather caused by inspecting the wrong tensor for sharding.
 - Current code records `m3_sharded` on weight metadata and calls `ggml_metalium_m3_gather(out, src0)`.
 - Output and buffer_get_tensor shape assertions are enabled. See `SUPERSEDED.md` for the discarded hypotheses and temporary assertion workarounds.
+
+## TT-Metal v0.79 port lessons
+
+The Metalium backend can compile against both pinned TT-Metal `13adda80` and official stable `v0.79.0` (`de546d3b14`) with a small compatibility layer:
+
+- `TensorSpec` moved from `ttnn` to `tt::tt_metal`.
+- `StorageType` moved from `tt::tt_metal` to `ttnn`.
+- `create_device_tensor` moved from `tt::tt_metal` to `ttnn`. Select it with the presence of `<tt-metalium/tensor/tensor_types.hpp>`; v0.74 exposes only the experimental tensor header.
+- Host storage should use `const auto&` because the concrete namespace changed.
+- v0.79 needs explicit `tt-umd`, `tt_stl`, `tracy`, and YAML link search paths. `-Wl,--no-as-needed` keeps the transitive libraries available.
+- v0.79 deletes deprecated SFPI helpers. Replace `float_to_int16` with `convert<vSMag16>`, replace vector `int32_to_float` with `convert<vFloat>`, use `RoundMode::Nearest`, and wrap a scalar runtime position in `vInt` before conversion.
+
+A runtime switch is not only a host-library change. Moving directly from v0.79 to v0.74 after a clean close can leave fabric firmware state that the older runtime cannot synchronize. Stop the exact test process and perform one scoped N300 reset before validating the other runtime. Do not interpret this transition failure as a source compatibility failure.

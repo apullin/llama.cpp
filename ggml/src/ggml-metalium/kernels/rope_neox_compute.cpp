@@ -64,8 +64,8 @@ sfpi_inline sfpi::vFloat _reciprocal_compat_(const sfpi::vFloat in)
 inline vFloat vector_sin_phase(vFloat x)
 {
     vFloat v = x;
-    vInt whole_v = float_to_int16(v, RoundMode::NearestEven);
-    v -= int32_to_float(whole_v, RoundMode::NearestEven);
+    auto whole_v = convert<vSMag16>(v, RoundMode::Nearest);
+    v -= convert<vFloat>(whole_v, RoundMode::Nearest);
 
     v = sfpu_sinpi(v);
     v_if(whole_v & 1) { v = -v; }
@@ -166,7 +166,7 @@ inline void rope_tile(int pos, float inv_d, int vec_offset)
 
         int internal_offset = ((i / 2 == 0) ? 0 : 16);
         int pos_in_vector = vec_offset + internal_offset;
-        vFloat block_lane_id = int32_to_float((vConstTileId & 15) + (pos_in_vector + i % 2)); // No mod operator on SFPI, use bit hack
+        vFloat block_lane_id = convert<vFloat>((vConstTileId & 15) + (pos_in_vector + i % 2)); // No mod operator on SFPI, use bit hack
         vFloat exponent = block_lane_id * vConstFloatPrgm2;
 
         vFloat term_to_exp = -exponent * vConstFloatPrgm0 - vConstFloatPrgm1;
@@ -194,7 +194,7 @@ inline void rope_tile(int pos, float inv_d, int vec_offset)
             #endif // else mscahe *= 1 (the other half collasps to 0) - does nothing
         #endif
 
-        vFloat vpos = int32_to_float(pos);
+        vFloat vpos = convert<vFloat>(vInt(pos), RoundMode::Nearest);
         vFloat angle_phase = vpos * theta;
         vFloat sin_value = vector_sin_phase(angle_phase) * mscale;
         vFloat cos_value = vector_sin_phase(0.5f - angle_phase) * mscale;

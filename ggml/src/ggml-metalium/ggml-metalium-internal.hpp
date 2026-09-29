@@ -93,7 +93,7 @@ inline void ggml_metalium_op_src_sanity_check(const ggml_tensor * node, int idx)
     GGML_ASSERT(node->src[idx]->extra != NULL);
     auto* meta = (ggml_tensor_extra_metalium*)(node->src[idx]->extra);
     if(meta->tensor != NULL) {
-        GGML_ASSERT(meta->tensor->storage_type() == tt::tt_metal::StorageType::DEVICE);
+        GGML_ASSERT(meta->tensor->storage_type() == ttnn::StorageType::DEVICE);
         GGML_ASSERT(meta->tensor->layout() == tt::tt_metal::Layout::TILE);
     }
 }
