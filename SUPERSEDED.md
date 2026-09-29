@@ -57,7 +57,8 @@ Upstream tensor-split and meta-backend changes do not replace the Metalium mesh 
 - `cmake --build build-rebase-check --target llama-completion -j 64` passed.
 - Rebuilt the missing pinned tt-metal `build_Release` with all 64 logical CPUs. Clang 22 was exposed under the pinned toolchain's `clang-20` names, and install required `CMAKE_BUILD_WITH_INSTALL_RPATH=ON` plus the build-library directories in `LD_LIBRARY_PATH`.
 - The full Metalium-enabled llama.cpp build passed after updating the upstream `graph_optimize` callback signature.
-- A 1x2 device smoke reached topology discovery but stopped on a stale ETH heartbeat before model load. No device reset was performed.
+- The first 1x2 device smoke stopped on a stale ETH heartbeat before model load. After explicit user approval, `tt-smi -r` restored the card.
+- Post-reset 1x2 `-ngl 1` direct completion exited 0 and matched the CPU completion byte-for-byte. Decode measured 9.07 tok/s.
 
 ## Restored working-tree audit
 
