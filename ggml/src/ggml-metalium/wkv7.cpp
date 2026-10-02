@@ -69,7 +69,7 @@ wkv7_device::RWKVWKV7DeviceOperation::create_output_tensors(
     const tensor_args_t& tensor_args)
 {
     auto spec = compute_output_specs(a, tensor_args);
-    return metalium_create_device_tensor(spec, tensor_args.r.device());
+    return ttnn::create_device_tensor(spec, tensor_args.r.device());
 }
 
 void wkv7_device::RWKVWKV7DeviceOperation::validate_on_program_cache_miss(

@@ -1,8 +1,4 @@
-#if __has_include(<tt-metalium/tensor/tensor_types.hpp>)
 #include <tt-metalium/tensor/tensor_types.hpp>
-#else
-#include <tt-metalium/experimental/tensor/tensor_types.hpp>
-#endif
 #include "fmt/base.h"
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
@@ -3538,7 +3534,7 @@ ggml_backend_metalium_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
         }
 
         g_metalium_fabric_copy_count.fetch_add(1, std::memory_order_relaxed);
-        auto ret = metalium_create_device_tensor(src_tensor.tensor_spec(), bufctx->device.get());
+        auto ret = ttnn::create_device_tensor(src_tensor.tensor_spec(), bufctx->device.get());
         ttnn::experimental::send_async(src_tensor, *send_socket);
         ttnn::experimental::recv_async(ret, *recv_socket);
         ggml_metalium_store_tensor(dst_meta, std::move(ret));
@@ -4891,7 +4887,7 @@ static bool metalium_execute_ffn_parallel(ggml_backend_metalium_context * ctx, M
     }
     GGML_ASSERT(send_input != nullptr && recv_input != nullptr && send_output != nullptr && recv_output != nullptr);
 
-    auto remote_input = metalium_create_device_tensor(input->tensor_spec(), up_weight->device());
+    auto remote_input = ttnn::create_device_tensor(input->tensor_spec(), up_weight->device());
     ttnn::experimental::send_async(*input, *send_input);
     ttnn::experimental::recv_async(remote_input, *recv_input);
 
@@ -4902,7 +4898,7 @@ static bool metalium_execute_ffn_parallel(ggml_backend_metalium_context * ctx, M
         ggml_metalium_q1_attn_program_config(group.nodes[1]->src[0], group.nodes[1]->src[1]),
         std::nullopt, make_compute_kernel_config(remote_input.device()));
 
-    auto local_up_out = metalium_create_device_tensor(up_out.tensor_spec(), input->device());
+    auto local_up_out = ttnn::create_device_tensor(up_out.tensor_spec(), input->device());
     ttnn::experimental::send_async(up_out, *send_output);
 
     auto * gate_meta = static_cast<ggml_tensor_extra_metalium *>(group.nodes[0]->extra);

@@ -1,5 +1,4 @@
 #include <unordered_map>
-#include <utility>
 
 #include "tt-metalium/host_api.hpp"
 #include "tt-metalium/kernel_types.hpp"
@@ -9,14 +8,6 @@
 
 using CoreSpec = std::variant<tt::tt_metal::CoreCoord, tt::tt_metal::CoreRange, tt::tt_metal::CoreRangeSet>;
 
-template <typename... Args>
-auto metalium_create_device_tensor(Args&&... args) {
-#if __has_include(<tt-metalium/tensor/tensor_types.hpp>)
-    return ttnn::create_device_tensor(std::forward<Args>(args)...);
-#else
-    return tt::tt_metal::create_device_tensor(std::forward<Args>(args)...);
-#endif
-}
 tt::tt_metal::CBHandle MakeCircularBuffer(
     tt::tt_metal::Program& program, const CoreSpec& core, tt::CBIndex cb, uint32_t size, uint32_t page_size, tt::DataFormat format);
 tt::tt_metal::CBHandle MakeCircularBuffer(tt::tt_metal::Program& program, const CoreSpec& core, tt::CBIndex cb, uint32_t n_tiles, tt::tt_metal::DataType dtype);

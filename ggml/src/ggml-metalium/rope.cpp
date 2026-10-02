@@ -44,7 +44,7 @@ rope_device::RoPEDeviceOperation::create_output_tensors(
     const tensor_args_t& tensor_args)
 {
     auto spec = compute_output_specs(operation_attributes, tensor_args);
-    return metalium_create_device_tensor(spec, tensor_args.src.device());
+    return ttnn::create_device_tensor(spec, tensor_args.src.device());
 }
 
 void rope_device::RoPEDeviceOperation::validate_on_program_cache_miss(

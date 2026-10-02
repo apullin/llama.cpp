@@ -168,7 +168,7 @@ struct EmbeddingGatherDeviceOperation {
             ta.variant.memory_config()));
     }
     static tensor_return_value_t create_output_tensors(const operation_attributes_t& attr, const tensor_args_t& ta) {
-        return metalium_create_device_tensor(compute_output_specs(attr, ta), ta.variant.device());
+        return ttnn::create_device_tensor(compute_output_specs(attr, ta), ta.variant.device());
     }
 };
 

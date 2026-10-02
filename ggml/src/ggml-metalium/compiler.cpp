@@ -2326,7 +2326,7 @@ bool TtprmNormAffineLowering::apply(ggml_backend_metalium_context * ctx, const S
     ttprm::View bv = ttprm::view_of(*bias).squeeze_dim(0).squeeze_dim(0);
 
     auto make_output = [&]() {
-        return metalium_create_device_tensor(
+        return ttnn::create_device_tensor(
             tt::tt_metal::TensorSpec(
                 ttnn::Shape({
                     (uint32_t) site.root->ne[3],
@@ -2693,7 +2693,7 @@ bool RkGateLowering::apply(ggml_backend_metalium_context * ctx, const Site & sit
         return tv.slice({ { 0, tv.rows(), 1 }, { 0, tv.cols(), 1 } }).reshape({ hc * nt, hs });
     };
     auto make_output = [&]() {
-        return metalium_create_device_tensor(
+        return ttnn::create_device_tensor(
             tt::tt_metal::TensorSpec(
                 ttnn::Shape({
                     (uint32_t) site.root->ne[3],
@@ -2804,7 +2804,7 @@ bool KUpdateLowering::apply(ggml_backend_metalium_context * ctx, const Site & si
     ttprm::View kav0 = ttprm::view_of(*kat);
     ttprm::View kav = kav0.slice({ { 0, kav0.rows(), 1 }, { 0, kav0.cols(), 1 } }).reshape({ hc, hs });
 
-    auto out = metalium_create_device_tensor(
+    auto out = ttnn::create_device_tensor(
         tt::tt_metal::TensorSpec(
             ttnn::Shape({
                 (uint32_t) site.root->ne[3],
