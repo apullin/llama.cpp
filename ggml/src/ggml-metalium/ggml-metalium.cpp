@@ -44,6 +44,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -114,6 +115,8 @@
 #include "soft_max.hpp"
 #include "wkv7.hpp"
 #include "slice_write_folded.hpp"
+#include "direct_kv_write.hpp"
+#include "paged_q_align.hpp"
 
 extern void metalium_register_all_kernel();
 
@@ -161,6 +164,60 @@ static void ggml_metalium_init_fabric_copy_links(
     const std::shared_ptr<ttnn::MeshDevice> & device1);
 static std::atomic<uint64_t> g_metalium_fabric_copy_count{0};
 static std::atomic<uint64_t> g_metalium_fabric_copy_fallback_count{0};
+static std::atomic<uint64_t> g_metalium_qkv_batched_attempt_count{0};
+static std::atomic<uint64_t> g_metalium_qkv_batched_fused_count{0};
+static std::atomic<uint64_t> g_metalium_qkv_batched_logical_rows{0};
+static std::atomic<uint64_t> g_metalium_ffn_swiglu_count{0};
+static std::atomic<uint64_t> g_metalium_ffn_swiglu_rows{0};
+static std::atomic<uint64_t> g_metalium_kv_direct_write_count{0};
+static std::atomic<uint64_t> g_metalium_kv_direct_write_rows{0};
+static std::atomic<uint64_t> g_metalium_kv_paged_attention_count{0};
+static std::atomic<uint64_t> g_metalium_kv_paged_attention_rows{0};
+static std::atomic<uint64_t> g_metalium_kv_paged_attention_q32{0};
+static std::atomic<uint64_t> g_metalium_kv_paged_attention_q64{0};
+
+static void ggml_metalium_report_qkv_batched_stats() {
+    const uint64_t attempts = g_metalium_qkv_batched_attempt_count.exchange(0, std::memory_order_relaxed);
+    const uint64_t fused = g_metalium_qkv_batched_fused_count.exchange(0, std::memory_order_relaxed);
+    const uint64_t rows = g_metalium_qkv_batched_logical_rows.exchange(0, std::memory_order_relaxed);
+    if(attempts != 0) {
+        fprintf(stderr, "[metalium-qkv-batched] attempts=%llu fused=%llu logical_rows=%llu\n",
+            (unsigned long long)attempts, (unsigned long long)fused, (unsigned long long)rows);
+    }
+}
+
+static void ggml_metalium_report_ffn_swiglu_stats() {
+    const uint64_t calls = g_metalium_ffn_swiglu_count.exchange(0, std::memory_order_relaxed);
+    const uint64_t rows = g_metalium_ffn_swiglu_rows.exchange(0, std::memory_order_relaxed);
+    if(calls != 0) {
+        fprintf(stderr, "[metalium-ffn-swiglu] enabled=%d calls=%llu rows=%llu\n",
+            getenv("GGML_METALIUM_INTERNAL_FFN_SWIGLU") != nullptr ? 1 : 0,
+            (unsigned long long)calls, (unsigned long long)rows);
+    }
+}
+
+static void ggml_metalium_report_kv_direct_write_stats() {
+    const uint64_t calls = g_metalium_kv_direct_write_count.exchange(0, std::memory_order_relaxed);
+    const uint64_t rows = g_metalium_kv_direct_write_rows.exchange(0, std::memory_order_relaxed);
+    if(calls != 0) {
+        fprintf(stderr, "[metalium-kv-direct-write] calls=%llu rows=%llu\n",
+            (unsigned long long)calls, (unsigned long long)rows);
+    }
+}
+
+static void ggml_metalium_report_kv_paged_attention_stats() {
+    const uint64_t calls = g_metalium_kv_paged_attention_count.exchange(0, std::memory_order_relaxed);
+    const uint64_t rows = g_metalium_kv_paged_attention_rows.exchange(0, std::memory_order_relaxed);
+    const uint64_t q32 = g_metalium_kv_paged_attention_q32.exchange(0, std::memory_order_relaxed);
+    const uint64_t q64 = g_metalium_kv_paged_attention_q64.exchange(0, std::memory_order_relaxed);
+    if(calls != 0) {
+        fprintf(stderr, "[metalium-kv-paged-attention] enabled=%d calls=%llu rows=%llu q32=%llu q64=%llu\n",
+            getenv("GGML_METALIUM_KV_PAGED_ATTENTION") != nullptr ? 1 : 0,
+            (unsigned long long)calls, (unsigned long long)rows,
+            (unsigned long long)q32, (unsigned long long)q64);
+    }
+}
+
 
 struct MetaliumBackendEvent {
     std::optional<tt::tt_metal::distributed::MeshEvent> value;
@@ -243,10 +300,15 @@ ttnn::DeviceComputeKernelConfig make_compute_kernel_config(ttnn::IDevice* device
 {
     ttnn::DeviceComputeKernelConfig cfg;
     if (device->arch() == tt::ARCH::WORMHOLE_B0 || device->arch() == tt::ARCH::BLACKHOLE) {
+        static const bool fp32_dest_acc =
+            getenv("GGML_METALIUM_MATMUL_FP32_DEST_ACC") != nullptr;
+        static const bool fp32_hifi3 =
+            getenv("GGML_METALIUM_MATMUL_FP32_HIFI3") != nullptr;
         cfg = ttnn::WormholeComputeKernelConfig{
-            .math_fidelity = tt::tt_metal::MathFidelity::HiFi4,
+            .math_fidelity = fp32_hifi3 ?
+                tt::tt_metal::MathFidelity::HiFi3 : tt::tt_metal::MathFidelity::HiFi4,
             .math_approx_mode = false,
-            .fp32_dest_acc_en = false,
+            .fp32_dest_acc_en = fp32_dest_acc,
             .packer_l1_acc = false
         };
     }
@@ -255,6 +317,24 @@ ttnn::DeviceComputeKernelConfig make_compute_kernel_config(ttnn::IDevice* device
         abort();
     }
     return cfg;
+}
+
+static ttnn::DeviceComputeKernelConfig make_lm_head_compute_kernel_config(ttnn::IDevice* device)
+{
+    GGML_ASSERT(device->arch() == tt::ARCH::WORMHOLE_B0 || device->arch() == tt::ARCH::BLACKHOLE);
+    return ttnn::WormholeComputeKernelConfig{
+        .math_fidelity = tt::tt_metal::MathFidelity::HiFi3,
+        .math_approx_mode = false,
+        .fp32_dest_acc_en = false,
+        .packer_l1_acc = false,
+    };
+}
+
+static bool ggml_metalium_fast_lm_head(const ggml_tensor * weight, const ggml_tensor * input) {
+    static const bool enabled = getenv("GGML_METALIUM_LM_HEAD_FAST_COMPUTE") != nullptr;
+    return enabled && weight != nullptr && input != nullptr && input->ne[1] <= 32 &&
+        std::string_view(weight->name).ends_with("output.weight") &&
+        weight->ne[0] == 4096 && weight->ne[1] == 151936;
 }
 
 // Debug flags that can be enabled at runtime. Because recompiling the backend takes forever
@@ -269,6 +349,8 @@ struct ggml_backend_metalium_debug_flags {
     bool print_trace_mem = false;           // DRAM attribution under tracing: pinned intermediates vs IO vs trace cmd buffers
     bool release_activations = false;       // Release intermediate device tensors after their last effective read
     bool print_reorder_mem = false;         // Print modeled DRAM pressure before/after graph reordering
+    bool elide_output_copies = false;       // Replace unique non-traced output handles instead of copying into old buffers
+    bool print_output_store = false;        // Report output-handle replacement/copy counters at teardown
 };
 
 static const ggml_backend_metalium_debug_flags g_debug_flags = []() {
@@ -292,7 +374,9 @@ static const ggml_backend_metalium_debug_flags g_debug_flags = []() {
         .disable_graph_compiler = parse_env("GGML_METALIUM_DISABLE_GRAPH_COMPILER"),
         .print_trace_mem = parse_env("GGML_METALIUM_TRACE_MEM"),
         .release_activations = parse_env("GGML_METALIUM_RELEASE_ACTIVATIONS"),
-        .print_reorder_mem = parse_env("GGML_METALIUM_REORDER_MEM")
+        .print_reorder_mem = parse_env("GGML_METALIUM_REORDER_MEM"),
+        .elide_output_copies = parse_env("GGML_METALIUM_ELIDE_OUTPUT_COPIES"),
+        .print_output_store = parse_env("GGML_METALIUM_OUTPUT_STORE_STATS")
     };
 }();
 
@@ -316,6 +400,30 @@ static bool g_metalium_trace_enabled = []() {
 }();
 
 static thread_local bool g_metalium_trace_capturing = false;
+
+static std::atomic<uint64_t> g_metalium_output_store_replaced{0};
+static std::atomic<uint64_t> g_metalium_output_store_copied{0};
+static std::atomic<uint64_t> g_metalium_output_store_assigned{0};
+static std::atomic<uint64_t> g_metalium_output_store_shared{0};
+static std::atomic<uint64_t> g_metalium_output_store_alias_preserved{0};
+
+static void ggml_metalium_report_output_store_stats() {
+    const uint64_t replaced = g_metalium_output_store_replaced.exchange(0, std::memory_order_relaxed);
+    const uint64_t copied = g_metalium_output_store_copied.exchange(0, std::memory_order_relaxed);
+    const uint64_t assigned = g_metalium_output_store_assigned.exchange(0, std::memory_order_relaxed);
+    const uint64_t shared = g_metalium_output_store_shared.exchange(0, std::memory_order_relaxed);
+    const uint64_t alias_preserved =
+        g_metalium_output_store_alias_preserved.exchange(0, std::memory_order_relaxed);
+    if((g_debug_flags.elide_output_copies || g_debug_flags.print_output_store) &&
+       (replaced != 0 || copied != 0 || assigned != 0 || shared != 0 || alias_preserved != 0)) {
+        fprintf(stderr,
+            "[metalium-output-store] elide=%d trace=%d replaced=%llu copied=%llu assigned=%llu shared=%llu alias_preserved=%llu\n",
+            (int)g_debug_flags.elide_output_copies, (int)g_metalium_trace_enabled,
+            (unsigned long long)replaced, (unsigned long long)copied,
+            (unsigned long long)assigned, (unsigned long long)shared,
+            (unsigned long long)alias_preserved);
+    }
+}
 
 extern "C" {
 void ggml_backend_metalium_set_tracing(bool enable) {
@@ -581,6 +689,32 @@ static tt::tt_metal::HostBuffer quantized_ggml_data_to_tt_host_buffer(const void
     }
 }
 
+static tt::tt_metal::HostBuffer quantized_ggml_data_to_tt_host_buffer_kn(
+        const void * src, const ggml_tensor * tensor) {
+    const ggml_type_traits * trait = ggml_get_type_traits(tensor->type);
+    const size_t k = tensor->ne[0];
+    const size_t n = tensor->ne[1];
+    const size_t row_bytes = ggml_row_size(tensor->type, k);
+    constexpr size_t block_rows = 32;
+    GGML_ASSERT(trait->to_float != nullptr);
+    GGML_ASSERT(tensor->ne[2] == 1 && tensor->ne[3] == 1);
+
+    std::vector<float> transposed(k * n);
+    std::vector<float> block(block_rows * k);
+    const auto * bytes = static_cast<const std::byte *>(src);
+    for(size_t row = 0; row < n; row += block_rows) {
+        const size_t rows = std::min(block_rows, n - row);
+        trait->to_float(bytes + row * row_bytes, block.data(), rows * k);
+        for(size_t col = 0; col < k; col++) {
+            float * dst = transposed.data() + col * n + row;
+            for(size_t r = 0; r < rows; r++) {
+                dst[r] = block[r * k + col];
+            }
+        }
+    }
+    return tt::tt_metal::HostBuffer(std::move(transposed));
+}
+
 // Copies the content of the TT tensor into memory pointed by `dst` with data of type `dst_ggtype`
 // This function will do it's best to convert whatever it is in the TT tensor into types accaptable
 // by GGML
@@ -589,7 +723,6 @@ static tt::tt_metal::HostBuffer quantized_ggml_data_to_tt_host_buffer(const void
 template <typename SrcType>
 static void copy_tt_tensor_to_host_pointer(const ttnn::Tensor& tensor, void* dst, ggml_type dst_ggtype) {
     ttnn::Shape shape = tensor.logical_shape();
-    ttnn::Shape padded_shape = tensor.padded_shape();
 
     // we only support reading from these types that is held in TT tensor
     static_assert(std::is_same_v<SrcType, float> || std::is_same_v<SrcType, bfloat16> || std::is_same_v<SrcType, uint32_t>);
@@ -605,6 +738,10 @@ static void copy_tt_tensor_to_host_pointer(const ttnn::Tensor& tensor, void* dst
     }
     GGML_ASSERT(row_major_tensor.storage_type() == ttnn::StorageType::HOST);
     GGML_ASSERT(row_major_tensor.layout() == ttnn::ROW_MAJOR_LAYOUT);
+    // Index the host buffer with its own padded shape. After untilize()/cpu() it can be smaller
+    // than the tiled tensor's padded shape, and indexing with the latter overran the buffer
+    // (GGML_ASSERT(src_idx < buf_size) on small or multi-head outputs).
+    const ttnn::Shape padded_shape = row_major_tensor.padded_shape();
 
 
     // Grab the data held in the TT tensor
@@ -661,8 +798,8 @@ static void copy_tt_tensor_to_host_pointer(const ttnn::Tensor& tensor, void* dst
         GGML_UNREACHABLE();
     };
 
-    // Tilize to ROW_MAJOR doesn't mean the tensor is contiguous. It produces tensors that has 0 padded up to the nearest
-    // 32 elements on last two (for GGML first two) dimentions.
+    // The row-major buffer is laid out by padded_shape (taken from the host tensor above), which
+    // may still carry zero padding on the last two (for GGML first two) dimensions.
     // Compute the stride for each dimension
     std::array<size_t, 4> stride = {1, 1, 1, 1};
     size_t cumulative_stride = 1;
@@ -793,6 +930,19 @@ ttnn::Tensor reshape_tt_tensor_into_ggml(const ttnn::Tensor& tensor, const struc
         target_shape[i] = node->ne[GGML_MAX_DIMS - i - 1];
     }
 
+    uint64_t target_volume = 1;
+    for(uint32_t dim : target_shape) target_volume *= dim;
+    if(tensor.logical_shape().volume() != target_volume) {
+        std::ostringstream diag;
+        diag << "[metalium-reshape-volume] logical=" << tensor.logical_shape()
+             << " padded=" << tensor.padded_shape() << " target=[";
+        for(int i = 0; i < GGML_MAX_DIMS; i++) diag << (i ? "," : "") << target_shape[i];
+        diag << "] node=" << ggml_op_desc(node) << " '" << node->name << "'"
+             << " src0=" << (node->src[0] ? ggml_op_desc(node->src[0]) : "null")
+             << " src0_name='" << (node->src[0] ? node->src[0]->name : "") << "'";
+        std::cerr << diag.str() << std::endl;
+    }
+
     // std::cerr << "Reshaping tensor " << tensor.logical_shape() << " to " << target_shape << std::endl;
     if (getenv("GGML_METALIUM_RESHAPE_HISTO")) {
         static std::mutex m;
@@ -816,22 +966,43 @@ ttnn::Tensor reshape_tt_tensor_into_ggml(const ttnn::Tensor& tensor, const struc
     return ttnn::reshape(tensor, ttnn::Shape(target_shape));
 }
 
-// Attempt to write value into the existing tensor buffer so tracing can work (needing a stable address
-// ) this API likely needs rethinking because creating a new tensor here MIGHT break tracing.
+// Tracing and shared aliases need stable addresses. Ordinary non-traced outputs do not: when the
+// opt-in gate is enabled, replace a uniquely-owned compatible handle and let TTNN retire the old
+// allocation instead of dispatching a full device-to-device copy after every repeated execution.
+// In-place TTNN operations return a new Tensor handle for the same buffer; rebinding that handle is
+// also safe with aliases because the physical address and contents are already shared.
 void ggml_metalium_store_tensor(ggml_tensor_extra_metalium* meta, ttnn::Tensor value)
 {
     const auto& cur = meta->tensor;
+    const bool track = g_debug_flags.elide_output_copies || g_debug_flags.print_output_store;
     meta->row_folded.reset();
-    if(cur != nullptr
-        && !g_metalium_trace_capturing
+    const bool compatible = cur != nullptr
         && cur->storage_type()  == ttnn::StorageType::DEVICE
         && value.storage_type() == ttnn::StorageType::DEVICE
         && cur->dtype()         == value.dtype()
         && cur->layout()        == value.layout()
-        && cur->logical_shape() == value.logical_shape()) {
-        ttnn::copy(value, *cur);   // write into the existing buffer -> address preserved
+        && cur->logical_shape() == value.logical_shape();
+    const bool replacement_candidate = compatible
+        && !g_metalium_trace_capturing
+        && !g_metalium_trace_enabled
+        && g_debug_flags.elide_output_copies;
+    const bool same_buffer = replacement_candidate && cur->buffer() == value.buffer();
+    const bool replace = replacement_candidate && (same_buffer || cur.use_count() == 1);
+    if(compatible && !g_metalium_trace_capturing && !replace) {
+        if(g_debug_flags.elide_output_copies && !g_metalium_trace_enabled && cur.use_count() != 1) {
+            g_metalium_output_store_alias_preserved.fetch_add(1, std::memory_order_relaxed);
+        }
+        ttnn::copy(value, *cur);   // stable address for tracing or another shared metadata handle
+        if(track) {
+            g_metalium_output_store_copied.fetch_add(1, std::memory_order_relaxed);
+        }
     } else {
         meta->tensor = std::make_shared<ttnn::Tensor>(std::move(value));
+        if(replace) {
+            g_metalium_output_store_replaced.fetch_add(1, std::memory_order_relaxed);
+        } else if(track) {
+            g_metalium_output_store_assigned.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 }
 
@@ -839,6 +1010,9 @@ void ggml_metalium_store_tensor(ggml_tensor_extra_metalium* meta, std::shared_pt
 {
     meta->row_folded.reset();
     meta->tensor = std::move(value);
+    if(g_debug_flags.elide_output_copies || g_debug_flags.print_output_store) {
+        g_metalium_output_store_shared.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 static void ggml_metalium_store_row_folded(
@@ -1167,10 +1341,44 @@ static std::shared_ptr<ttnn::Tensor> realize_ggml_view_impl(const ggml_tensor* t
                 "metalium: contiguous view not aligned to parent row width (unsupported)");
             const uint32_t r0 = off_e / Cc;
             const uint32_t r1 = r0 + len_e / Cc;
-            std::array<uint32_t, GGML_MAX_DIMS> start{0, 0, r0, 0};
-            std::array<uint32_t, GGML_MAX_DIMS> end{pshape[0], pshape[1], r1, Cc};
-            std::array<uint32_t, GGML_MAX_DIMS> step = {1, 1, 1, 1};
-            ttnn::Tensor tmp = ggml_metalium_narrow_single_dim_or_slice(*parent, start, end, step);
+            const uint32_t parent_rows = (uint32_t)(pshape.volume() / Cc);
+            GGML_ASSERT(r1 <= parent_rows);
+
+            ttnn::Tensor tmp;
+            const bool direct_plane_range =
+                pshape.rank() == 4 && pshape[0] == 1 && pshape[2] != 0 &&
+                r0 % pshape[2] == 0 && r1 % pshape[2] == 0 &&
+                r1 / pshape[2] <= pshape[1];
+            const bool direct_rows_in_plane =
+                pshape.rank() == 4 && pshape[0] == 1 && pshape[2] != 0 && r1 > r0 &&
+                r0 / pshape[2] == (r1 - 1) / pshape[2];
+            if(direct_plane_range) {
+                // Preserve TTNN's tiled outer-dimension ordering. A metadata reshape
+                // from [1, streams, rows, width] to [1, 1, streams*rows, width] has
+                // the right volume but does not preserve the logical stream order on
+                // this runtime. KV stream views are naturally rectangular slices.
+                const uint32_t s0 = r0 / pshape[2];
+                const uint32_t s1 = r1 / pshape[2];
+                std::array<uint32_t, GGML_MAX_DIMS> pstart{0, s0, 0, 0};
+                std::array<uint32_t, GGML_MAX_DIMS> pend{1, s1, pshape[2], Cc};
+                std::array<uint32_t, GGML_MAX_DIMS> pstep{1, 1, 1, 1};
+                tmp = ggml_metalium_narrow_single_dim_or_slice(*parent, pstart, pend, pstep);
+            } else if(direct_rows_in_plane) {
+                const uint32_t stream = r0 / pshape[2];
+                const uint32_t row0 = r0 % pshape[2];
+                const uint32_t row1 = row0 + (r1 - r0);
+                std::array<uint32_t, GGML_MAX_DIMS> pstart{0, stream, row0, 0};
+                std::array<uint32_t, GGML_MAX_DIMS> pend{1, stream + 1, row1, Cc};
+                std::array<uint32_t, GGML_MAX_DIMS> pstep{1, 1, 1, 1};
+                tmp = ggml_metalium_narrow_single_dim_or_slice(*parent, pstart, pend, pstep);
+            } else {
+                ttnn::Tensor flat_rows = ttnn::reshape(
+                    *parent, ttnn::Shape({1, 1, parent_rows, Cc}));
+                std::array<uint32_t, GGML_MAX_DIMS> fstart{0, 0, r0, 0};
+                std::array<uint32_t, GGML_MAX_DIMS> fend{1, 1, r1, Cc};
+                std::array<uint32_t, GGML_MAX_DIMS> fstep{1, 1, 1, 1};
+                tmp = ggml_metalium_narrow_single_dim_or_slice(flat_rows, fstart, fend, fstep);
+            }
             res = reshape_tt_tensor_into_ggml(tmp, tensor);
         }
         // The fast path, this is what TTNN is designed for (direct slicing)
@@ -1287,6 +1495,11 @@ ggml_metalium_q1_attn_program_config(const ggml_tensor * weight, const ggml_tens
        !ggml_metalium_weight_kn(weight)) {
         return std::nullopt;
     }
+    auto env_size = [](const char * name, size_t fallback) {
+        const char * value = getenv(name);
+        const int parsed = value != nullptr ? std::atoi(value) : 0;
+        return parsed > 0 ? static_cast<size_t>(parsed) : fallback;
+    };
     const std::string_view name(weight->name);
     size_t grid_x = 0;
     size_t grid_y = 0;
@@ -1300,17 +1513,36 @@ ggml_metalium_q1_attn_program_config(const ggml_tensor * weight, const ggml_tens
         grid_x = 8; grid_y = 7; per_core_n = 4; in0_block_w = 4;
     } else if(wide_enabled && (name.ends_with(".ffn_gate.weight") || name.ends_with(".ffn_up.weight")) &&
               weight->ne[0] == 6656 && weight->ne[1] == 19968) {
-        grid_x = 8; grid_y = 4; per_core_n = 20; in0_block_w = 4;
+        grid_x = env_size("GGML_METALIUM_FFN_GRID_X", 8);
+        grid_y = env_size("GGML_METALIUM_FFN_GRID_Y", 4);
+        per_core_n = env_size("GGML_METALIUM_FFN_PER_CORE_N", 20);
+        in0_block_w = env_size("GGML_METALIUM_FFN_BLOCK_W", 4);
+        const size_t k_tiles = weight->ne[0] / 32;
+        const size_t n_tiles = weight->ne[1] / 32;
+        const bool valid = grid_x <= 8 && grid_y <= 8 && per_core_n <= 64 &&
+            in0_block_w <= 32 && k_tiles % in0_block_w == 0 &&
+            grid_x * grid_y * per_core_n >= n_tiles;
+        if(!valid) {
+            static std::atomic<bool> warned{false};
+            if(!warned.exchange(true, std::memory_order_relaxed)) {
+                fprintf(stderr,
+                    "Metalium invalid FFN geometry %zux%zu n=%zu block_w=%zu; using 8x4 n=20 block_w=4\n",
+                    grid_x, grid_y, per_core_n, in0_block_w);
+            }
+            grid_x = 8; grid_y = 4; per_core_n = 20; in0_block_w = 4;
+        }
     } else {
         return std::nullopt;
     }
+    size_t out_subblock_w = std::min<size_t>(per_core_n, 4);
+    while(per_core_n % out_subblock_w != 0) out_subblock_w--;
     tt::tt_metal::CoreRangeSet workers(tt::tt_metal::CoreRange(
         tt::tt_metal::CoreCoord(0, 0), tt::tt_metal::CoreCoord(grid_x - 1, grid_y - 1)));
     ttnn::operations::matmul::MatmulMultiCoreReuseMultiCast1DProgramConfig config{
         .compute_with_storage_grid_size = tt::tt_metal::CoreCoord(grid_x, grid_y),
         .in0_block_w = in0_block_w,
         .out_subblock_h = 1,
-        .out_subblock_w = std::min<size_t>(per_core_n, 4),
+        .out_subblock_w = out_subblock_w,
         .out_block_h = 1,
         .out_block_w = per_core_n,
         .per_core_M = 1,
@@ -1366,15 +1598,59 @@ static void ggml_backend_metalium_mul_mat(ggml_backend_metalium_context * ctx, s
         auto &b = *bp;
         auto program_config = ggml_metalium_q1_attn_program_config(src0, src1);
 
-        auto out = ttnn::operations::matmul::matmul(
-            b, a,
-            /* transpose_a            = */ false,
-            /* transpose_b            = */ !ggml_metalium_weight_kn(src0),
-            /* memory_config          = */ dst_meta->memory_config,
-            /* dtype                  = */ std::nullopt,
-            /* program_config         = */ program_config,
-            /* activation             = */ std::nullopt,
-            /* compute_kernel_config  = */ make_compute_kernel_config(a.device()));
+        const bool fast_lm_head = ggml_metalium_fast_lm_head(src0, src1);
+        auto compute_kernel_config = fast_lm_head ?
+            make_lm_head_compute_kernel_config(b.device()) : make_compute_kernel_config(b.device());
+        if(fast_lm_head) {
+            static std::atomic<bool> reported{false};
+            if(!reported.exchange(true, std::memory_order_relaxed)) {
+                fprintf(stderr, "[metalium-lm-head] fast compute enabled for %s\n", src0->name);
+            }
+        }
+
+        auto run_matmul = [&](ttnn::Tensor & input, ttnn::Tensor & weight) {
+            return ttnn::operations::matmul::matmul(
+                input, weight,
+                /* transpose_a            = */ false,
+                /* transpose_b            = */ !ggml_metalium_weight_kn(src0),
+                /* memory_config          = */ dst_meta->memory_config,
+                /* dtype                  = */ std::nullopt,
+                /* program_config         = */ program_config,
+                /* activation             = */ std::nullopt,
+                /* compute_kernel_config  = */ compute_kernel_config);
+        };
+
+        ttnn::Tensor out = [&]() {
+            if(b.device() == a.device()) {
+                return run_matmul(b, a);
+            }
+
+            auto * links = g_metalium_fabric_copy_links.get();
+            tt::tt_metal::distributed::MeshSocket * send_input = nullptr;
+            tt::tt_metal::distributed::MeshSocket * recv_input = nullptr;
+            tt::tt_metal::distributed::MeshSocket * send_output = nullptr;
+            tt::tt_metal::distributed::MeshSocket * recv_output = nullptr;
+            if(links != nullptr && b.device() == links->device0.get() && a.device() == links->device1.get()) {
+                send_input = links->send01.get(); recv_input = links->recv01.get();
+                send_output = links->send10.get(); recv_output = links->recv10.get();
+            } else if(links != nullptr && b.device() == links->device1.get() && a.device() == links->device0.get()) {
+                send_input = links->send10.get(); recv_input = links->recv10.get();
+                send_output = links->send01.get(); recv_output = links->recv01.get();
+            }
+            GGML_ASSERT(send_input != nullptr && recv_input != nullptr &&
+                send_output != nullptr && recv_output != nullptr &&
+                "cross-device matmul requires initialized fabric links");
+
+            auto remote_input = ttnn::create_device_tensor(b.tensor_spec(), a.device());
+            ttnn::experimental::send_async(b, *send_input);
+            ttnn::experimental::recv_async(remote_input, *recv_input);
+            auto remote_out = run_matmul(remote_input, a);
+            auto local_out = ttnn::create_device_tensor(remote_out.tensor_spec(), b.device());
+            ttnn::experimental::send_async(remote_out, *send_output);
+            ttnn::experimental::recv_async(local_out, *recv_output);
+            g_metalium_fabric_copy_count.fetch_add(2, std::memory_order_relaxed);
+            return local_out;
+        }();
         // If the weight was sharded across the mesh at upload (M3), the matmul output
         // is a per-device partial along the output dim; gather it back to full width.
         out = ggml_metalium_m3_gather(std::move(out), src0);
@@ -1567,6 +1843,25 @@ static void ggml_backend_metalium_cpy(ggml_backend_metalium_context * ctx, struc
 
     // TODO: Type cast to the appropriate type
     ggml_metalium_store_tensor(dst_meta, res);
+    if(src0->extra != nullptr) {
+        auto * src_meta = static_cast<ggml_tensor_extra_metalium *>(src0->extra);
+        dst_meta->host_i32_scalar = src_meta->host_i32_scalar;
+        static const bool kv_paged_attention = getenv("GGML_METALIUM_KV_PAGED_ATTENTION") != nullptr;
+        if(kv_paged_attention) {
+            dst_meta->host_i32_values = src_meta->host_i32_values;
+            dst_meta->host_f32_values = src_meta->host_f32_values;
+            dst_meta->host_f32_shape = src_meta->host_f32_shape;
+        }
+        if(dst->op == GGML_OP_CPY && dst->src[1] != nullptr && dst->src[1]->extra != nullptr) {
+            auto * src1_meta = static_cast<ggml_tensor_extra_metalium *>(dst->src[1]->extra);
+            src1_meta->host_i32_scalar = src_meta->host_i32_scalar;
+            if(kv_paged_attention) {
+                src1_meta->host_i32_values = src_meta->host_i32_values;
+                src1_meta->host_f32_values = src_meta->host_f32_values;
+                src1_meta->host_f32_shape = src_meta->host_f32_shape;
+            }
+        }
+    }
 }
 
 static bool ggml_backend_metalium_activations(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst, ggml_unary_op op) {
@@ -1902,7 +2197,6 @@ static bool ggml_backend_metalium_can_set_rows(const struct ggml_tensor * dst)
 
 static void ggml_backend_metalium_set_rows(ggml_backend_metalium_context * ctx, struct ggml_tensor * dst)
 {
-    GGML_UNUSED(ctx);
     GGML_METALIUM_OP_SANITY_CHECK(dst);
     GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
     GGML_METALIUM_OP_SRC_SANITY_CHECK(dst, 2);
@@ -1943,6 +2237,8 @@ static void ggml_backend_metalium_set_rows(ggml_backend_metalium_context * ctx, 
         static const bool tensor_index = getenv("GGML_METALIUM_KV_TENSOR_INDEX") != nullptr;
         static const bool force_tosa = getenv("GGML_METALIUM_KV_TOSA") != nullptr;
         static const bool kv_shared_cache = getenv("GGML_METALIUM_KV_SHARED_CACHE") != nullptr;
+        static const bool direct_kv_write = getenv("GGML_METALIUM_KV_DIRECT_WRITE") != nullptr;
+        static const bool kv_paged_attention = getenv("GGML_METALIUM_KV_PAGED_ATTENTION") != nullptr;
         const auto device_grid = src->device()->compute_with_storage_grid_size();
         const auto dst_shape = real_dst->logical_shape();
         const auto src_shape = src->logical_shape();
@@ -1951,8 +2247,75 @@ static void ggml_backend_metalium_set_rows(ggml_backend_metalium_context * ctx, 
             dst_shape[0] == 1 && dst_shape[1] == 1 &&
             src_shape[0] == 1 && src_shape[1] == 1 &&
             src_shape[2] == updates && src_shape[3] == dst_shape[3];
-        if (kv_shared_cache && shared_cache_geometry && updates > 1 && updates <= device_grid.x * device_grid.y) {
+        const std::string_view cache_name(dst->src[2]->name);
+        const bool cache_k = cache_name.starts_with("cache_k_l");
+        const bool cache_v = cache_name.starts_with("cache_v_l");
+        if(kv_paged_attention && (cache_k || cache_v)) {
+            auto & shadow = cache_k ? ctx->last_k_indices : ctx->last_v_indices;
+            if(idx_meta != nullptr && idx_meta->host_i32_values.size() == updates &&
+                    std::all_of(idx_meta->host_i32_values.begin(), idx_meta->host_i32_values.end(),
+                        [](int32_t value) { return value >= 0; })) {
+                shadow = idx_meta->host_i32_values;
+            } else {
+                shadow.clear();
+            }
+        }
+        constexpr uint32_t bf16_tile_bytes = sizeof(bfloat16) * 32 * 32;
+        const bool direct_kv_storage =
+            src->storage_type() == ttnn::StorageType::DEVICE &&
+            real_dst->storage_type() == ttnn::StorageType::DEVICE &&
+            idx->storage_type() == ttnn::StorageType::DEVICE &&
+            src->device() == real_dst->device() && src->device() == idx->device() &&
+            src->layout() == tt::tt_metal::Layout::TILE &&
+            real_dst->layout() == tt::tt_metal::Layout::TILE &&
+            idx->layout() == tt::tt_metal::Layout::ROW_MAJOR &&
+            src->dtype() == tt::tt_metal::DataType::BFLOAT16 &&
+            real_dst->dtype() == tt::tt_metal::DataType::BFLOAT16 &&
+            idx->dtype() == tt::tt_metal::DataType::UINT32 &&
+            src->memory_config().memory_layout() == tt::tt_metal::TensorMemoryLayout::INTERLEAVED &&
+            real_dst->memory_config().memory_layout() == tt::tt_metal::TensorMemoryLayout::INTERLEAVED &&
+            idx->memory_config().memory_layout() == tt::tt_metal::TensorMemoryLayout::INTERLEAVED &&
+            src->memory_config().buffer_type() == tt::tt_metal::BufferType::DRAM &&
+            real_dst->memory_config().buffer_type() == tt::tt_metal::BufferType::DRAM &&
+            idx->memory_config().buffer_type() == tt::tt_metal::BufferType::DRAM &&
+            src->buffer()->page_size() == bf16_tile_bytes &&
+            real_dst->buffer()->page_size() == bf16_tile_bytes &&
+            idx->buffer()->num_pages() == 1 &&
+            idx->buffer()->page_size() >= updates * sizeof(uint32_t);
+        const bool direct_kv_padded_shape =
+            src->padded_shape().rank() == 4 && src->padded_shape()[2] == 32 &&
+            src->padded_shape()[3] == 1024;
+        const bool direct_kv_geometry =
+            direct_kv_write && !g_metalium_trace_enabled && shared_cache_geometry && direct_kv_storage &&
+            direct_kv_padded_shape &&
+            updates >= 1 && updates <= 32 && src_shape[3] == 1024 && dst_shape[2] % 32 == 0 &&
+            (cache_k || cache_v);
+        if(direct_kv_geometry) {
+            ttnn::Tensor res = ttggml::direct_kv_write(*src, *real_dst, *idx);
+            auto alias = std::make_shared<ttnn::Tensor>(std::move(res));
+            ggml_metalium_store_tensor(dst_meta, alias);
+            ggml_metalium_store_tensor(real_dst_meta, std::move(alias));
+            g_metalium_kv_direct_write_count.fetch_add(1, std::memory_order_relaxed);
+            g_metalium_kv_direct_write_rows.fetch_add(updates, std::memory_order_relaxed);
+        } else if (kv_shared_cache && shared_cache_geometry && updates > 1 && updates <= device_grid.x * device_grid.y) {
             ttnn::Tensor src_users = ttnn::transpose(*src, 1, 2);
+            // The token axis was tiled before the transpose, so its padded extent (32)
+            // moves into the user axis. Sharding that tensor directly gives every real
+            // user all 32 padded token slots (64 KiB/core for Qwen) and collides with
+            // paged_update_cache's static circular buffers. Materialize only the real
+            // users while retaining the padded head/width tile dimensions.
+            static const bool compact_users =
+                getenv("GGML_METALIUM_KV_SHARED_CACHE_COMPACT") != nullptr;
+            if(compact_users) {
+                const auto logical = src_users.logical_shape();
+                const auto padded = src_users.padded_shape();
+                GGML_ASSERT(logical.rank() == 4 && logical[1] == updates);
+                std::array<uint32_t, 4> begin{0, 0, 0, 0};
+                std::array<uint32_t, 4> end{
+                    logical[0], updates, padded[2], padded[3]};
+                std::array<uint32_t, 4> step{1, 1, 1, 1};
+                src_users = ttnn::slice(src_users, begin, end, step);
+            }
             const uint32_t shard_width = src_users.padded_shape()[-1];
             const uint32_t shard_height = (uint32_t) (src_users.physical_volume() / shard_width / updates);
             auto shard_grid = tt::tt_metal::num_cores_to_corerangeset(
@@ -2727,6 +3090,134 @@ static bool ggml_backend_metalium_can_rwkv_wkv7(const struct ggml_tensor * dst)
     return true;
 }
 
+struct MetaliumPagedCacheView {
+    ttnn::Tensor tensor;
+    uint32_t capacity;
+    uint32_t heads;
+    uint32_t head_dim;
+};
+
+static std::optional<MetaliumPagedCacheView> ggml_metalium_resolve_paged_cache_view(
+        const ggml_tensor * permuted,
+        std::string_view expected_name_prefix) {
+    if(permuted == nullptr || permuted->op != GGML_OP_PERMUTE || permuted->src[0] == nullptr) {
+        return std::nullopt;
+    }
+    std::array<int32_t, GGML_MAX_DIMS> axes{};
+    memcpy(axes.data(), permuted->op_params, sizeof(axes));
+    if(axes != std::array<int32_t, GGML_MAX_DIMS>{0, 2, 1, 3}) {
+        return std::nullopt;
+    }
+
+    const ggml_tensor * view = permuted->src[0];
+    if(view->op != GGML_OP_VIEW || view->view_src == nullptr || view->view_offs != 0) {
+        return std::nullopt;
+    }
+    const ggml_tensor * base = view->view_src;
+    const uint32_t head_dim = (uint32_t)permuted->ne[0];
+    const uint32_t active_kv = (uint32_t)permuted->ne[1];
+    const uint32_t heads = (uint32_t)permuted->ne[2];
+    if(head_dim == 0 || heads == 0 || active_kv == 0 || active_kv % 32 != 0 ||
+            permuted->ne[3] != 1 ||
+            view->ne[0] != head_dim || view->ne[1] != heads ||
+            view->ne[2] != active_kv || view->ne[3] != 1 ||
+            base->ne[0] != (int64_t)head_dim * heads ||
+            base->ne[1] < active_kv || base->ne[1] % 32 != 0 ||
+            base->ne[2] != 1 || base->ne[3] != 1 ||
+            view->nb[1] != ggml_row_size(view->type, head_dim) ||
+            view->nb[2] != ggml_row_size(view->type, (int64_t)head_dim * heads) ||
+            !std::string_view(base->name).starts_with(expected_name_prefix) ||
+            base->extra == nullptr) {
+        return std::nullopt;
+    }
+
+    auto * base_meta = static_cast<ggml_tensor_extra_metalium *>(base->extra);
+    if(base_meta->tensor == nullptr) {
+        return std::nullopt;
+    }
+    const auto & storage = *base_meta->tensor;
+    const auto shape = storage.logical_shape();
+    constexpr uint32_t bf16_tile_bytes = sizeof(bfloat16) * 32 * 32;
+    if(storage.storage_type() != ttnn::StorageType::DEVICE ||
+            storage.layout() != tt::tt_metal::Layout::TILE ||
+            storage.dtype() != tt::tt_metal::DataType::BFLOAT16 ||
+            storage.memory_config().memory_layout() != tt::tt_metal::TensorMemoryLayout::INTERLEAVED ||
+            storage.memory_config().buffer_type() != tt::tt_metal::BufferType::DRAM ||
+            storage.buffer() == nullptr || storage.buffer()->page_size() != bf16_tile_bytes ||
+            shape.rank() != 4 || shape[0] != 1 || shape[1] != 1 ||
+            shape[2] != (uint32_t)base->ne[1] ||
+            shape[3] != head_dim * heads) {
+        return std::nullopt;
+    }
+
+    const uint32_t capacity = shape[2];
+    auto paged = storage.reshape(ttnn::Shape({capacity / 32, heads, 32, head_dim}));
+    if(paged.buffer() != storage.buffer() || paged.physical_volume() != storage.physical_volume()) {
+        return std::nullopt;
+    }
+    return MetaliumPagedCacheView{std::move(paged), capacity, heads, head_dim};
+}
+
+static bool ggml_metalium_mask_is_exact_causal_prefix(
+        const ggml_tensor * mask,
+        const std::vector<int32_t> & indices,
+        uint32_t active_kv) {
+    if(mask == nullptr || mask->extra == nullptr || indices.empty()) {
+        return false;
+    }
+    const auto * meta = static_cast<const ggml_tensor_extra_metalium *>(mask->extra);
+    if(meta->host_f32_values.empty() ||
+            meta->host_f32_shape[0] != active_kv ||
+            meta->host_f32_shape[1] < (int64_t)indices.size() ||
+            meta->host_f32_shape[2] != 1 || meta->host_f32_shape[3] != 1) {
+        return false;
+    }
+    const size_t shadow_rows = (size_t)meta->host_f32_shape[1];
+    if(meta->host_f32_values.size() != (size_t)active_kv * shadow_rows) {
+        return false;
+    }
+    for(size_t row = 0; row < indices.size(); ++row) {
+        const int32_t last_visible = indices[row];
+        if(last_visible < 0 || (uint32_t)last_visible >= active_kv) {
+            return false;
+        }
+        for(uint32_t col = 0; col < active_kv; ++col) {
+            const float value = meta->host_f32_values[row * active_kv + col];
+            const bool keep = std::isfinite(value) && std::fabs(value) <= 1.0e-6f;
+            const bool drop = value <= -1.0e20f;
+            if(col <= (uint32_t)last_visible ? !keep : !drop) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static std::shared_ptr<ttnn::Tensor> ggml_metalium_identity_page_table(
+        ggml_backend_metalium_context * ctx,
+        ttnn::distributed::MeshDevice * device,
+        uint32_t active_kv) {
+    auto found = ctx->kv_identity_page_tables.find(active_kv);
+    if(found != ctx->kv_identity_page_tables.end()) {
+        return found->second;
+    }
+    GGML_ASSERT(active_kv >= 32 && active_kv % 32 == 0);
+    const uint32_t pages = active_kv / 32;
+    std::vector<int32_t> values(pages);
+    for(uint32_t page = 0; page < pages; ++page) {
+        values[page] = (int32_t)page;
+    }
+    const tt::tt_metal::TensorLayout layout(
+        tt::tt_metal::DataType::INT32,
+        tt::tt_metal::Layout::ROW_MAJOR,
+        ttnn::DRAM_MEMORY_CONFIG);
+    const tt::tt_metal::TensorSpec spec(ttnn::Shape({1, pages}), layout);
+    auto table = std::make_shared<ttnn::Tensor>(
+        ttnn::Tensor::from_vector(std::move(values), spec, device));
+    ctx->kv_identity_page_tables.emplace(active_kv, table);
+    return table;
+}
+
 static bool ggml_backend_metalium_can_flash_attn(const struct ggml_tensor * dst)
 {
     if(!g_debug_flags.experimental_ops) {
@@ -2826,7 +3317,6 @@ static void ggml_backend_metalium_flash_attn(ggml_backend_metalium_context * ctx
 {
     GGML_METALIUM_OP_SANITY_CHECK(dst);
     GGML_METALIUM_OP_SRC0_SANITY_CHECK(dst);
-    GGML_UNUSED(ctx);
     ggml_tensor_extra_metalium* dst_meta = (ggml_tensor_extra_metalium*)dst->extra;
 
     const ggml_tensor* q = dst->src[0];
@@ -2851,11 +3341,118 @@ static void ggml_backend_metalium_flash_attn(ggml_backend_metalium_context * ctx
     // which is exactly what SDPA accepts. GQA (n_head % n_head_kv == 0) is handled
     // natively by SDPA, so K/V are passed without manual head broadcasting.
     auto qt = *realize_ggml_view(q);
-    auto kt = *realize_ggml_view(k);
-    auto vt = *realize_ggml_view(v);
-
     const uint32_t Sq = qt.logical_shape()[2];
     const uint32_t Batch = qt.logical_shape()[0];
+
+    std::optional<ttnn::DeviceComputeKernelConfig> compute_kernel_config;
+    static const int fa_precision_device_id = []() {
+        const char * value = getenv("GGML_METALIUM_FA_PRECISION_DEVICE_ID");
+        return value != nullptr ? std::atoi(value) : -1;
+    }();
+    const bool fa_precision_device_selected =
+        fa_precision_device_id < 0 || ctx->device_id == fa_precision_device_id;
+    const bool fa_full_precision = fa_precision_device_selected &&
+        getenv("GGML_METALIUM_FA_FP32_ACC") != nullptr;
+    const bool fa_hifi4 = fa_precision_device_selected &&
+        (fa_full_precision || getenv("GGML_METALIUM_FA_HIFI4") != nullptr);
+    const bool fa_math_approx_off = fa_precision_device_selected &&
+        (fa_full_precision || getenv("GGML_METALIUM_FA_MATH_APPROX_OFF") != nullptr);
+    const bool fa_fp32_dest_acc = fa_precision_device_selected &&
+        (fa_full_precision || getenv("GGML_METALIUM_FA_FP32_DEST_ACC") != nullptr);
+    if(fa_hifi4 || fa_math_approx_off || fa_fp32_dest_acc) {
+        compute_kernel_config = ttnn::WormholeComputeKernelConfig{
+            .math_fidelity = fa_hifi4 ? tt::tt_metal::MathFidelity::HiFi4 : tt::tt_metal::MathFidelity::HiFi2,
+            .math_approx_mode = !fa_math_approx_off,
+            .fp32_dest_acc_en = fa_fp32_dest_acc,
+            .packer_l1_acc = false
+        };
+    }
+
+    // Ordinary single-sequence DFlash writes a compact cache tail and supplies
+    // an exact prefix-causal mask. In that narrow case the canonical
+    // [S, H*D] tiled cache is already byte-for-byte a 32-token paged cache:
+    // [S/32, H, 32, D]. Tensor::reshape creates a zero-copy metadata view, so
+    // chunked SDPA can read it without the usual reshape+transpose pair for K
+    // and V. The custom Q-align operation places Q in one or two aligned 32-row chunks.
+    static const bool kv_paged_attention = getenv("GGML_METALIUM_KV_PAGED_ATTENTION") != nullptr;
+    const bool matching_index_rows =
+        ctx->last_k_indices == ctx->last_v_indices &&
+        ctx->last_k_indices.size() == Sq;
+    bool consecutive_tail = matching_index_rows && !ctx->last_k_indices.empty();
+    for(size_t i = 1; consecutive_tail && i < ctx->last_k_indices.size(); ++i) {
+        consecutive_tail = ctx->last_k_indices[i] == ctx->last_k_indices[0] + (int32_t)i;
+    }
+    if(kv_paged_attention && !g_metalium_trace_enabled &&
+            Sq >= 2 && Sq <= 15 && Batch == 1 && mask != nullptr &&
+            consecutive_tail && k->ne[1] == v->ne[1] &&
+            ggml_metalium_mask_is_exact_causal_prefix(mask, ctx->last_k_indices, (uint32_t)k->ne[1])) {
+        const auto q_shape = qt.logical_shape();
+        const auto q_padded_shape = qt.padded_shape();
+        const bool q_align_supported =
+            qt.storage_type() == ttnn::StorageType::DEVICE &&
+            qt.layout() == tt::tt_metal::Layout::TILE &&
+            qt.dtype() == tt::tt_metal::DataType::BFLOAT16 &&
+            qt.memory_config().memory_layout() == tt::tt_metal::TensorMemoryLayout::INTERLEAVED &&
+            qt.memory_config().buffer_type() == tt::tt_metal::BufferType::DRAM &&
+            q_shape.rank() == 4 && q_shape[0] == 1 && q_shape[2] == Sq &&
+            q_shape[3] >= 32 && q_shape[3] <= 1024 && q_shape[3] % 32 == 0 &&
+            q_padded_shape[2] == 32 && q_padded_shape[3] == q_shape[3] &&
+            q_shape[1] <= qt.device()->compute_with_storage_grid_size().x *
+                qt.device()->compute_with_storage_grid_size().y;
+        auto paged_k = ggml_metalium_resolve_paged_cache_view(k, "cache_k_l");
+        auto paged_v = ggml_metalium_resolve_paged_cache_view(v, "cache_v_l");
+        if(q_align_supported && paged_k.has_value() && paged_v.has_value() &&
+                paged_k->capacity == paged_v->capacity &&
+                paged_k->heads == paged_v->heads &&
+                paged_k->head_dim == paged_v->head_dim &&
+                paged_k->head_dim == qt.logical_shape()[3] &&
+                paged_k->tensor.device() == qt.device() &&
+                paged_v->tensor.device() == qt.device()) {
+            const uint32_t active_kv = (uint32_t)k->ne[1];
+            const uint32_t start = (uint32_t)ctx->last_k_indices[0];
+            const uint32_t chunk_start = start - start % 32;
+            const uint32_t q_offset = start - chunk_start;
+            const uint32_t aligned_q = ((q_offset + Sq + 31) / 32) * 32;
+            GGML_ASSERT(aligned_q == 32 || aligned_q == 64);
+            if(chunk_start + aligned_q <= active_kv) {
+                auto aligned_qt = ttggml::paged_q_align(qt, q_offset, aligned_q);
+                auto page_table = ggml_metalium_identity_page_table(ctx, qt.device(), active_kv);
+                ttnn::operations::transformer::SDPAProgramConfig program_config{
+                    qt.device()->compute_with_storage_grid_size(),
+                    std::nullopt,
+                    32,
+                    32,
+                    std::nullopt,
+                    16};
+                auto res = ttnn::transformer::chunked_scaled_dot_product_attention(
+                    aligned_qt,
+                    paged_k->tensor,
+                    paged_v->tensor,
+                    *page_table,
+                    (int64_t)chunk_start,
+                    scale,
+                    /*memory_config=*/std::nullopt,
+                    program_config,
+                    compute_kernel_config);
+                res = ttnn::transpose(res, 1, 2);
+                const auto rs = res.logical_shape();
+                res = ggml_metalium_narrow_single_dim_or_slice(res,
+                    ttsl::SmallVector<uint32_t>{0u, q_offset, 0u, 0u},
+                    ttsl::SmallVector<uint32_t>{
+                        (uint32_t)rs[0], q_offset + Sq, (uint32_t)rs[2], (uint32_t)rs[3]},
+                    ttsl::SmallVector<uint32_t>{1u, 1u, 1u, 1u});
+                g_metalium_kv_paged_attention_count.fetch_add(1, std::memory_order_relaxed);
+                g_metalium_kv_paged_attention_rows.fetch_add(Sq, std::memory_order_relaxed);
+                (aligned_q == 32 ? g_metalium_kv_paged_attention_q32 : g_metalium_kv_paged_attention_q64)
+                    .fetch_add(1, std::memory_order_relaxed);
+                ggml_metalium_store_tensor(dst_meta, std::move(res));
+                return;
+            }
+        }
+    }
+
+    auto kt = *realize_ggml_view(k);
+    auto vt = *realize_ggml_view(v);
     const uint32_t SdpaSq = Sq == 1 ? 1 : ((Sq + 31) / 32) * 32;
     if(SdpaSq != Sq) {
         ttnn::SmallVector<std::array<uint32_t, 2>> padding{
@@ -2911,18 +3508,11 @@ static void ggml_backend_metalium_flash_attn(ggml_backend_metalium_context * ctx
     // ggml always supplies an additive mask with causality baked in -> use the
     // mask path with is_causal=false.
     // NOTE: SDPA runs in bf16, landing at NMSE ~6e-4 (q4_0 KV up to ~3.5e-3), over
-    // ggml's strict 5e-4 FA bound. A WormholeComputeKernelConfig{fp32_dest_acc_en=
-    // true, HiFi4} tightens it at a perf cost when GGML_METALIUM_FA_FP32_ACC is set.
-    std::optional<ttnn::DeviceComputeKernelConfig> compute_kernel_config;
-    if(getenv("GGML_METALIUM_FA_FP32_ACC") != nullptr) {
-        compute_kernel_config = ttnn::WormholeComputeKernelConfig{
-            .math_fidelity = tt::tt_metal::MathFidelity::HiFi4,
-            .math_approx_mode = false,
-            .fp32_dest_acc_en = true,
-            .packer_l1_acc = false
-        };
-    }
-
+    // ggml's strict 5e-4 FA bound. GGML_METALIUM_FA_FP32_ACC retains the original
+    // all-in precision switch (HiFi4, exact math, fp32 destination accumulation).
+    // Speculative decoding commonly places target and draft models on different
+    // ASICs; only the target needs strict greedy-token equality. The device selector
+    // scopes all precision overrides to one backend while the draft uses default SDPA.
     auto res = ttnn::transformer::scaled_dot_product_attention(
         qt,
         kt,
@@ -2966,6 +3556,10 @@ static void ggml_backend_metalium_free(ggml_backend_t backend) {
         fprintf(stderr, "[metalium-fabric-copy] direct=%llu fallback=%llu\n",
             (unsigned long long)fabric_copies, (unsigned long long)fabric_fallbacks);
     }
+    ggml_metalium_report_qkv_batched_stats();
+    ggml_metalium_report_kv_direct_write_stats();
+    ggml_metalium_report_kv_paged_attention_stats();
+    ggml_metalium_report_output_store_stats();
     // Release captured traces HERE (backend free runs while the program is alive), NOT at
     // atexit. Trace buffer deallocation calls GraphTracker::track_deallocate, which reads a
     // thread_local that is already destroyed during static teardown -> UAF segfault.
@@ -2973,6 +3567,9 @@ static void ggml_backend_metalium_free(ggml_backend_t backend) {
     if(ctx->device != nullptr && ctx->runtime != nullptr) {
         metalium_trace_release_all(ctx->device->get_mesh_device().get(), ctx->runtime);
     }
+    // Retire cached page-table device buffers while the backend runtime and
+    // device are both unquestionably alive.
+    ctx->kv_identity_page_tables.clear();
     // Recreated lazily by the next backend instance; destroy while GraphTracker is alive.
     g_metalium_fabric_copy_links.reset();
     metalium_backend_runtime_free(ctx->runtime);
@@ -3116,18 +3713,65 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     // weight on the peer ASIC. The paired executor moves only small activations over fabric.
     std::shared_ptr<ttnn::MeshDevice> tensor_device = bufctx->device;
     static const bool internal_ffn_parallel = getenv("GGML_METALIUM_INTERNAL_FFN_PARALLEL") != nullptr;
+    static const int internal_ffn_device_id = []() {
+        const char * value = getenv("GGML_METALIUM_INTERNAL_FFN_DEVICE_ID");
+        return value != nullptr ? std::atoi(value) : -1;
+    }();
+    static const bool internal_attn_gate_parallel =
+        getenv("GGML_METALIUM_INTERNAL_ATTN_GATE_PARALLEL") != nullptr &&
+        getenv("GGML_METALIUM_FABRIC_COPY") != nullptr;
     const std::string_view tensor_name(tensor->name);
-    if(internal_ffn_parallel && tensor_name.ends_with(".ffn_up.weight") &&
+    const bool internal_ffn_device_selected = internal_ffn_device_id < 0 ||
+        (internal_ffn_device_id == 0 && bufctx->device.get() == g_metalium_fabric_device0.get()) ||
+        (internal_ffn_device_id == 1 && bufctx->device.get() == g_metalium_fabric_device1.get());
+    if(internal_ffn_parallel && internal_ffn_device_selected && tensor_name.ends_with(".ffn_up.weight") &&
+       g_metalium_fabric_device0 != nullptr && g_metalium_fabric_device1 != nullptr) {
+        if(bufctx->device.get() == g_metalium_fabric_device0.get()) tensor_device = g_metalium_fabric_device1;
+        else if(bufctx->device.get() == g_metalium_fabric_device1.get()) tensor_device = g_metalium_fabric_device0;
+    }
+    // Keep two boundary-layer gates local so the 27/25 layer split remains balanced.
+    const bool local_attn_gate = tensor_name == "blk.25.attn_gate.weight" ||
+        tensor_name == "blk.26.attn_gate.weight";
+    if(internal_attn_gate_parallel && tensor_name.ends_with(".attn_gate.weight") && !local_attn_gate &&
        g_metalium_fabric_device0 != nullptr && g_metalium_fabric_device1 != nullptr) {
         if(bufctx->device.get() == g_metalium_fabric_device0.get()) tensor_device = g_metalium_fabric_device1;
         else if(bufctx->device.get() == g_metalium_fabric_device1.get()) tensor_device = g_metalium_fabric_device0;
     }
 
     meta->host_i32_scalar.reset();
-    if (ggtype == GGML_TYPE_I32 && offset == 0 && size == sizeof(int32_t)) {
-        int32_t value;
-        memcpy(&value, data, sizeof(value));
-        meta->host_i32_scalar = value;
+    static const bool kv_paged_attention = getenv("GGML_METALIUM_KV_PAGED_ATTENTION") != nullptr;
+    if(kv_paged_attention) {
+        meta->host_i32_values.clear();
+        meta->host_f32_values.clear();
+        meta->host_f32_shape.fill(0);
+    }
+    const bool whole_tensor = offset == 0 && size == ggml_nbytes(tensor);
+    if (ggtype == GGML_TYPE_I32 && whole_tensor) {
+        const auto * values = static_cast<const int32_t *>(data);
+        const size_t count = size / sizeof(int32_t);
+        if(count == 1) {
+            meta->host_i32_scalar = values[0];
+        }
+        if(kv_paged_attention && count <= 4096) {
+            meta->host_i32_values.assign(values, values + count);
+        }
+    }
+    const bool small_attention_mask =
+        kv_paged_attention && whole_tensor && tensor->ne[2] == 1 && tensor->ne[3] == 1 &&
+        tensor->ne[0] >= 32 && tensor->ne[0] % 32 == 0 && tensor->ne[1] <= 64 &&
+        size <= 128 * 1024 && (ggtype == GGML_TYPE_F16 || ggtype == GGML_TYPE_F32);
+    if(small_attention_mask) {
+        const size_t count = (size_t)ggml_nelements(tensor);
+        meta->host_f32_values.resize(count);
+        if(ggtype == GGML_TYPE_F16) {
+            const auto * values = static_cast<const ggml_fp16_t *>(data);
+            for(size_t i = 0; i < count; ++i) {
+                meta->host_f32_values[i] = ggml_fp16_to_fp32(values[i]);
+            }
+        } else {
+            memcpy(meta->host_f32_values.data(), data, count * sizeof(float));
+        }
+        std::copy(std::begin(tensor->ne), std::end(tensor->ne), meta->host_f32_shape.begin());
     }
 
     // Row-folded store owns its own whole-row scatter path (supports nonzero offsets).
@@ -3144,6 +3788,33 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
         // fprintf(stderr, "Warning: Metalium set_tensor() does not work with tensor views\n");
         return;
     }
+
+    static const char * shard_whitelist[] = {
+        ".attn_q.weight", ".attn_k.weight", ".attn_v.weight", ".attn_gate.weight",
+        ".attn_output.weight", ".ffn_up.weight", ".ffn_gate.weight", ".ffn_down.weight",
+        "output.weight",
+    };
+    bool name_ok = false;
+    for(const char * suffix : shard_whitelist) {
+        const std::string_view name(tensor->name);
+        if(name.size() >= strlen(suffix) && name.substr(name.size() - strlen(suffix)) == suffix) {
+            name_ok = true;
+            break;
+        }
+    }
+    int non_one_dims = 0;
+    for(int i = 0; i < GGML_MAX_DIMS; i++) {
+        if(tensor->ne[i] != 1) non_one_dims++;
+    }
+    // Store matmul-only 2D weights as [K,N], so matmul does not use strided transpose_b reads.
+    static const bool no_weight_kn = getenv("GGML_METALIUM_NO_WEIGHT_KN") != nullptr;
+    const bool weight_kn = name_ok && non_one_dims == 2 && !no_weight_kn;
+    const size_t num_devices = tensor_device->get_devices().size();
+    // Directly dequantize very large weights into host [K,N] order. Smaller weights transpose
+    // faster on device, but output.weight needs two 5.38 GB FP32 buffers and can exhaust DRAM.
+    const size_t fp32_upload_bytes = ggml_nelements(tensor) * sizeof(float);
+    const bool host_weight_kn = weight_kn && num_devices == 1 &&
+        ggml_is_quantized(ggtype) && ggml_is_contiguous(tensor) && fp32_upload_bytes >= (1ULL << 30);
 
     std::optional<tt::tt_metal::HostBuffer> storage;
     tt::tt_metal::DataType intermidiate_type = tt::tt_metal::DataType::BFLOAT16;
@@ -3168,7 +3839,9 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     else if (ggml_is_quantized(ggtype)) {
         // Even though in theory transfering BFP16 to device uses much less bandwidth then FP32. GGML nativly have support
         // converting quantized types into FP32. Converting to BFP16 would be an extra step making everything slower
-        storage = quantized_ggml_data_to_tt_host_buffer<float>(data, tensor);
+        storage = host_weight_kn
+            ? quantized_ggml_data_to_tt_host_buffer_kn(data, tensor)
+            : quantized_ggml_data_to_tt_host_buffer<float>(data, tensor);
         intermidiate_type = tt::tt_metal::DataType::FLOAT32;
     }
     else {
@@ -3182,6 +3855,9 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     for(int i = 0; i < GGML_MAX_DIMS; i++) {
         // GGML stores the shape in reverse order
         shape[i] = tensor->ne[GGML_MAX_DIMS - i - 1];
+    }
+    if(host_weight_kn) {
+        std::swap(shape[2], shape[3]);
     }
 
     std::optional<ttsl::SmallVector<int64_t>> permute;
@@ -3226,32 +3902,9 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
     // are consumed exclusively by MUL_MAT — the matmul handler all_gathers the partial
     // outputs back. Weights consumed by other ops (e.g. token_embd by the embedding
     // kernel, which needs the full vocab per device) must stay replicated.
-    static const char* shard_whitelist[] = {
-        ".attn_q.weight", ".attn_k.weight", ".attn_v.weight", ".attn_gate.weight",
-        ".attn_output.weight", ".ffn_up.weight", ".ffn_gate.weight", ".ffn_down.weight",
-        "output.weight",
-    };
     bool should_shard = false;
     int shard_dim = -1;
     static const bool m3_no_shard = getenv("GGML_METALIUM_M3_NO_SHARD") != nullptr;
-    size_t num_devices = tensor_device->get_devices().size();
-    bool name_ok = false;
-    for (const char* suffix : shard_whitelist) {
-        std::string_view name(tensor->name);
-        if (name.size() >= strlen(suffix) && name.substr(name.size() - strlen(suffix)) == suffix) {
-            name_ok = true;
-            break;
-        }
-    }
-    int non_one_dims = 0;
-    for (int i = 0; i < GGML_MAX_DIMS; i++) {
-        if (tensor->ne[i] != 1) non_one_dims++;
-    }
-    // [K,N] weight storage: matmul-only 2D weights are transposed before tilize so
-    // matmul runs with transpose_b=false (~1.4x faster; transpose_b forces strided
-    // DRAM reads). Applies with or without mesh sharding. Kill switch for A/B.
-    static const bool no_weight_kn = getenv("GGML_METALIUM_NO_WEIGHT_KN") != nullptr;
-    const bool weight_kn = name_ok && non_one_dims == 2 && tilize && !no_weight_kn;
     if (num_devices > 1 && !m3_no_shard) {
         size_t tensor_bytes = ggml_nbytes(tensor);
         const size_t min_shard_bytes = 1024 * 1024; // 1 MiB
@@ -3280,7 +3933,7 @@ static void ggml_backend_metalium_buffer_set_tensor(ggml_backend_buffer_t buffer
 
     if(tilize) {
         auto dev_t = to_device_tensor();
-        if (weight_kn) {
+        if (weight_kn && !host_weight_kn) {
             // Store [1,1,K,N] instead of GGML's natural [1,1,N,K]. Done on the
             // row-major tensor so the tilize below is the only quantization step
             // (transposing block-float tiles would dequant+requant).
@@ -3506,6 +4159,68 @@ ggml_backend_metalium_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
     }
     ttnn::Tensor & src_tensor = *src_tensor_ptr;
 
+    // A same-device copy into a GGML view must update the view's backing tensor.
+    // llama_memory_seq_cp() uses this for speculative decoding: each KV stream is
+    // a contiguous 2-D plane of one shared 3-D cache. Merely attaching a tensor to
+    // dst->extra leaves the shared root unchanged, so subsequent attention observes
+    // an empty/stale branch even though the sequence metadata says it was copied.
+    const ggml_tensor * src_root = src;
+    const ggml_tensor * dst_root = dst;
+    while(src_root->view_src != nullptr) src_root = src_root->view_src;
+    while(dst_root->view_src != nullptr) dst_root = dst_root->view_src;
+    const bool same_root_plane =
+        src_root == dst_root &&
+        src != src_root && dst != dst_root &&
+        src->view_src == src_root && dst->view_src == dst_root &&
+        ggml_n_dims(src_root) == 3 && src_root->ne[3] == 1 &&
+        src->ne[0] == src_root->ne[0] && dst->ne[0] == src_root->ne[0] &&
+        src->ne[1] == src_root->ne[1] && dst->ne[1] == src_root->ne[1] &&
+        src->ne[2] == 1 && src->ne[3] == 1 &&
+        dst->ne[2] == 1 && dst->ne[3] == 1 &&
+        ggml_is_contiguous(src) && ggml_is_contiguous(dst) &&
+        src_root->nb[2] != 0 &&
+        src->view_offs % src_root->nb[2] == 0 &&
+        dst->view_offs % src_root->nb[2] == 0;
+    if(same_root_plane) {
+        const uint32_t src_stream = (uint32_t)(src->view_offs / src_root->nb[2]);
+        const uint32_t dst_stream = (uint32_t)(dst->view_offs / src_root->nb[2]);
+        auto src_plane = realize_ggml_view(src);
+        auto root_tensor = realize_ggml_view(dst_root);
+        const auto root_shape = root_tensor->logical_shape();
+        const auto plane_shape = src_plane->logical_shape();
+        const bool valid_shapes =
+            src_stream < (uint32_t)src_root->ne[2] &&
+            dst_stream < (uint32_t)src_root->ne[2] &&
+            root_shape.rank() == 4 && plane_shape.rank() == 4 &&
+            root_shape[0] == 1 && root_shape[1] == (uint32_t)src_root->ne[2] &&
+            root_shape[2] == plane_shape[2] && root_shape[3] == plane_shape[3] &&
+            plane_shape[0] == 1 && plane_shape[1] == 1 &&
+            root_tensor->device() == src_plane->device() &&
+            root_tensor->dtype() == src_plane->dtype() &&
+            root_tensor->layout() == src_plane->layout();
+        if(valid_shapes) {
+            ttsl::SmallVector<uint32_t> begins{0, dst_stream, 0, 0};
+            ttsl::SmallVector<uint32_t> ends{
+                1, dst_stream + 1, (uint32_t)root_shape[2], (uint32_t)root_shape[3]};
+            ttsl::SmallVector<uint32_t> step{1, 1, 1, 1};
+            ttnn::experimental::slice_write(*src_plane, *root_tensor, begins, ends, step);
+            dst_meta->tensor.reset();
+            dst_meta->row_folded.reset();
+            static std::atomic<bool> reported{false};
+            if(getenv("GGML_METALIUM_KV_STREAM_COPY_LOG") != nullptr &&
+               !reported.exchange(true, std::memory_order_relaxed)) {
+                fprintf(stderr,
+                    "[metalium-kv-stream-copy] src=%u dst=%u plane=[%u,%u,%u,%u] root=[%u,%u,%u,%u]\n",
+                    src_stream, dst_stream,
+                    (uint32_t)plane_shape[0], (uint32_t)plane_shape[1],
+                    (uint32_t)plane_shape[2], (uint32_t)plane_shape[3],
+                    (uint32_t)root_shape[0], (uint32_t)root_shape[1],
+                    (uint32_t)root_shape[2], (uint32_t)root_shape[3]);
+            }
+            return true;
+        }
+    }
+
     // Direct cross-ASIC activation transfer. The GGML scheduler inserts copies at
     // backend boundaries; when both endpoints are our 1x1 submeshes, route those
     // copies over the on-card fabric rather than synchronously staging through host RAM.
@@ -3682,7 +4397,12 @@ struct metalium_trace_exec_state {
 
     // Lazily-memoized replay plan
     bool replay_plan_built = false;
-    std::vector<std::pair<ggml_tensor*, std::shared_ptr<ttnn::Tensor>>> pin_plan;  // input node + baked anchor
+    struct PinBinding {
+        int node_idx;
+        int src_idx;
+        std::shared_ptr<ttnn::Tensor> anchor;
+    };
+    std::vector<PinBinding> pin_plan;  // input location in the current graph + baked anchor
     std::vector<std::pair<int, std::shared_ptr<ttnn::Tensor>>> rebind_plan;        // boundary node idx + tensor
 };
 
@@ -3828,6 +4548,89 @@ static uint64_t metalium_trace_graph_signature(const ggml_cgraph* g) {
     return h;
 }
 
+// Structural trace key for graph instances that differ only in arena addresses.
+// Unlike metalium_trace_graph_signature(), this excludes data pointers only for
+// tensors explicitly marked as dynamic graph inputs. Non-input leaves retain their
+// data identity so equal-shaped layer weights/caches cannot share a hardware trace.
+// Canonical IDs preserve aliasing among dynamic inputs. Replay remains opt-in because
+// it relies on these invariants plus node topology, metadata, and op parameters.
+static uint64_t metalium_trace_structural_signature(const ggml_cgraph * g) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](uint64_t v) {
+        h ^= v;
+        h *= 1099511628211ull;
+    };
+    auto mix_name = [&](const ggml_tensor * t) {
+        for(size_t i = 0; i < GGML_MAX_NAME; ++i) {
+            const uint8_t c = (uint8_t)t->name[i];
+            mix(c);
+            if(c == 0) break;
+        }
+    };
+    auto mix_desc = [&](const ggml_tensor * t) {
+        mix((uint64_t)t->type);
+        mix((uint64_t)t->flags);
+        for(int d = 0; d < GGML_MAX_DIMS; ++d) {
+            mix((uint64_t)t->ne[d]);
+            mix((uint64_t)t->nb[d]);
+        }
+        mix_name(t);
+    };
+
+    std::unordered_map<const ggml_tensor *, int> index_of;
+    index_of.reserve(g->n_nodes);
+    for(int i = 0; i < g->n_nodes; ++i) {
+        index_of.emplace(g->nodes[i], i);
+    }
+
+    std::unordered_map<const ggml_tensor *, uint64_t> input_leaf_ids;
+    uint64_t next_input_leaf_id = 1;
+
+    auto mix_ref = [&](const ggml_tensor * t) {
+        if(t == nullptr) {
+            mix(0);
+            return;
+        }
+        const auto it = index_of.find(t);
+        if(it != index_of.end()) {
+            mix(1);
+            mix((uint64_t)it->second + 1);
+            return;
+        }
+        mix(2);
+        mix((uint64_t)t->op);
+        mix_desc(t);
+        mix((uint64_t)t->view_offs);
+        if((t->flags & GGML_TENSOR_FLAG_INPUT) != 0) {
+            auto [leaf_it, inserted] = input_leaf_ids.emplace(t, next_input_leaf_id);
+            if(inserted) {
+                ++next_input_leaf_id;
+            }
+            mix(1);
+            mix(leaf_it->second);
+        } else {
+            mix(2);
+            mix((uint64_t)(uintptr_t)t->data);
+        }
+    };
+
+    mix((uint64_t)g->n_nodes);
+    for(int i = 0; i < g->n_nodes; ++i) {
+        const ggml_tensor * n = g->nodes[i];
+        mix((uint64_t)n->op);
+        mix_desc(n);
+        mix((uint64_t)n->view_offs);
+        mix_ref(n->view_src);
+        for(int s = 0; s < GGML_MAX_SRC; ++s) {
+            mix_ref(n->src[s]);
+        }
+        const auto * params = reinterpret_cast<const uint8_t *>(n->op_params);
+        for(size_t b = 0; b < sizeof(n->op_params); ++b) {
+            mix(params[b]);
+        }
+    }
+    return h;
+}
 // Stable identity for a cgraph: uid if present, else the (slow) topology signature.
 uint64_t metalium_graph_key(const ggml_cgraph* g) {
     return g->uid != 0 ? g->uid : metalium_trace_graph_signature(g);
@@ -3925,7 +4728,7 @@ struct metalium_trace_dispatch {
                 if(m->tensor == nullptr || m->tensor->storage_type() != ttnn::StorageType::DEVICE) continue;
                 auto it = runtime->pinned_tensors.find(GGMLTensorMeta(s));
                 if(it == runtime->pinned_tensors.end()) continue;
-                state->pin_plan.emplace_back(s, it->second);
+                state->pin_plan.push_back({i, j, it->second});
             }
         }
         for(int i = 0; i < (int)state->node_tensors.size(); i++) {
@@ -3935,7 +4738,15 @@ struct metalium_trace_dispatch {
     }
 
     // Per-replay hot path: inject inputs and rebind boundary nodes from the cached plan, no walk.
-    void replay_inject() const { for(auto& pr : state->pin_plan) apply_pin(pr.first, pr.second); }
+    void replay_inject() const {
+        for(const auto & pr : state->pin_plan) {
+            if(pr.node_idx < 0 || pr.node_idx >= graph->n_nodes ||
+               pr.src_idx < 0 || pr.src_idx >= GGML_MAX_SRC) continue;
+            ggml_tensor * node = graph->nodes[pr.node_idx];
+            ggml_tensor * src = node != nullptr ? node->src[pr.src_idx] : nullptr;
+            if(src != nullptr) apply_pin(src, pr.anchor);
+        }
+    }
     // FIXME: In theory replay can avoid this rebind; measure before removing it.
     void replay_rebind() const {
         for(auto& pr : state->rebind_plan) {
@@ -3962,6 +4773,15 @@ struct metalium_trace_dispatch {
     //   reach here; real-model n_tokens gating is a later rung.
     bool begin(ggml_backend_metalium_context* ctx, ggml_cgraph* cgraph) {
         if(!g_metalium_trace_enabled) return false;
+        // Speculative decoding can place the target and draft models on different ASICs.
+        // Their graphs have independent state lifetimes, so allow tracing only the target
+        // while leaving the draft eager. Tracing both through one process can otherwise
+        // replay stale draft state and destroy acceptance.
+        static const int trace_device_id = []() {
+            const char * value = getenv("GGML_METALIUM_TRACE_DEVICE_ID");
+            return value != nullptr ? std::atoi(value) : -1;
+        }();
+        if(trace_device_id >= 0 && ctx->device_id != trace_device_id) return false;
         if(getenv("GGML_METALIUM_INTERNAL_FFN_PARALLEL") != nullptr &&
            getenv("GGML_METALIUM_INTERNAL_FFN_TRACE") == nullptr) return false;
         static const bool multirow_kv_trace_safe = getenv("GGML_METALIUM_KV_SHARED_CACHE") != nullptr;
@@ -3985,7 +4805,10 @@ struct metalium_trace_dispatch {
         runtime = ctx->runtime;
         // uid is OPTIONAL and some times not set. We use it if present, else fall back to a signature
         // of the graph's topology and node ops (slow).
-        uint64_t key = cgraph->uid != 0 ? cgraph->uid : metalium_trace_graph_signature(cgraph);
+        static const bool structural_key =
+            getenv("GGML_METALIUM_TRACE_STRUCTURAL_KEY") != nullptr;
+        uint64_t key = structural_key ? metalium_trace_structural_signature(cgraph) :
+            (cgraph->uid != 0 ? cgraph->uid : metalium_trace_graph_signature(cgraph));
         state = &runtime->trace_exec_states[key];
         state->passes++;
 
@@ -4034,6 +4857,7 @@ struct metalium_trace_dispatch {
         g_metalium_trace_capturing = false;
         state->captured = true;
         snapshot_nodes();
+        build_replay_plan();
         ttnn::operations::trace::execute_trace(mesh, state->tid, std::nullopt, /*blocking*/false);
         if(state->peer_mesh != nullptr) {
             ttnn::operations::trace::execute_trace(state->peer_mesh, state->peer_tid, std::nullopt, /*blocking*/false);
@@ -4650,6 +5474,7 @@ struct MetaliumOpProfiler {
 
 struct MetaliumQkvGroup {
     std::array<ggml_tensor *, 3> nodes{};
+    ggml_tensor * gate_node = nullptr;
     ggml_tensor * root = nullptr;
     bool executed = false;
     bool fused = false;
@@ -4671,23 +5496,54 @@ static int metalium_qkv_kind(const ggml_tensor * node) {
     return -1;
 }
 
+static bool metalium_attn_gate_node(const ggml_tensor * node) {
+    if(node == nullptr || node->op != GGML_OP_MUL_MAT || node->src[0] == nullptr || node->src[1] == nullptr) {
+        return false;
+    }
+    return std::string_view(node->src[0]->name).ends_with(".attn_gate.weight");
+}
+
 static MetaliumQkvPlan metalium_build_qkv_plan(ggml_cgraph * cgraph) {
     MetaliumQkvPlan plan;
     static const bool enabled = getenv("GGML_METALIUM_QKV_PARALLEL") != nullptr;
+    static const bool batched_one_tile =
+        getenv("GGML_METALIUM_QKV_PARALLEL_BATCHED") != nullptr;
+    static const bool attn_gate_parallel =
+        getenv("GGML_METALIUM_INTERNAL_ATTN_GATE_PARALLEL") != nullptr &&
+        getenv("GGML_METALIUM_FABRIC_COPY") != nullptr;
     if(!enabled || cgraph == nullptr) return plan;
 
     struct Pending {
         std::array<ggml_tensor *, 3> nodes{};
         std::array<int, 3> indices{ -1, -1, -1 };
+        ggml_tensor * gate_node = nullptr;
+        int gate_index = -1;
     };
     std::unordered_map<const ggml_tensor *, Pending> pending;
     for(int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         const int kind = metalium_qkv_kind(node);
-        if(kind < 0 || node->src[1]->ne[1] != 1 || node->src[1]->ne[2] != 1) continue;
+        const bool gate = attn_gate_parallel && g_metalium_fabric_copy_links != nullptr &&
+            metalium_attn_gate_node(node);
+        if(kind < 0 && !gate) continue;
+        const bool single_row = node->src[1]->ne[1] == 1 && node->src[1]->ne[2] == 1;
+        // Matmul M is expressed in tiles by the descriptor config. Inputs with 2..32
+        // logical rows still occupy one M tile, so the existing per_core_M=1 QKV
+        // descriptors can be reused. Keep this opt-in until exact target verification
+        // establishes that TTNN preserves the partial logical row extent end to end.
+        const bool partial_one_tile =
+            kind >= 0 && batched_one_tile &&
+            node->src[1]->ne[1] > 1 && node->src[1]->ne[1] <= 32 &&
+            node->src[1]->ne[2] == 1 && node->src[1]->ne[3] == 1;
+        if(!single_row && !partial_one_tile) continue;
         Pending & p = pending[node->src[1]];
-        p.nodes[kind] = node;
-        p.indices[kind] = i;
+        if(gate) {
+            p.gate_node = node;
+            p.gate_index = i;
+        } else {
+            p.nodes[kind] = node;
+            p.indices[kind] = i;
+        }
     }
     for(auto & item : pending) {
         Pending & p = item.second;
@@ -4695,7 +5551,8 @@ static MetaliumQkvPlan metalium_build_qkv_plan(ggml_cgraph * cgraph) {
         auto * qm = static_cast<ggml_tensor_extra_metalium *>(p.nodes[0]->src[0]->extra);
         auto * km = static_cast<ggml_tensor_extra_metalium *>(p.nodes[1]->src[0]->extra);
         auto * vm = static_cast<ggml_tensor_extra_metalium *>(p.nodes[2]->src[0]->extra);
-        if(qm == nullptr || km == nullptr || vm == nullptr || qm->m3_sharded || km->m3_sharded || vm->m3_sharded) continue;
+        if(qm == nullptr || km == nullptr || vm == nullptr || qm->tensor == nullptr || km->tensor == nullptr ||
+           vm->tensor == nullptr || qm->m3_sharded || km->m3_sharded || vm->m3_sharded) continue;
         if(qm->weight_kn != km->weight_kn || qm->weight_kn != vm->weight_kn) continue;
         MetaliumQkvGroup group;
         group.nodes = p.nodes;
@@ -4703,9 +5560,18 @@ static MetaliumQkvPlan metalium_build_qkv_plan(ggml_cgraph * cgraph) {
         if(p.indices[1] < p.indices[root_kind]) root_kind = 1;
         if(p.indices[2] < p.indices[root_kind]) root_kind = 2;
         group.root = p.nodes[root_kind];
+        if(p.gate_node != nullptr) {
+            auto * gate_weight_meta = static_cast<ggml_tensor_extra_metalium *>(p.gate_node->src[0]->extra);
+            if(gate_weight_meta != nullptr && gate_weight_meta->tensor != nullptr &&
+               gate_weight_meta->tensor->device() != km->tensor->device()) {
+                group.gate_node = p.gate_node;
+                if(p.gate_index < p.indices[root_kind]) group.root = p.gate_node;
+            }
+        }
         const size_t group_idx = plan.groups.size();
         plan.groups.push_back(group);
         for(ggml_tensor * n : group.nodes) if(n != nullptr) plan.member[n] = group_idx;
+        if(group.gate_node != nullptr) plan.member[group.gate_node] = group_idx;
     }
     return plan;
 }
@@ -4715,7 +5581,16 @@ struct MetaliumQkvPlacement {
     tt::tt_metal::CoreRangeSet cores;
 };
 
-static MetaliumQkvPlacement metalium_qkv_parallel_placement(size_t kind) {
+static std::optional<MetaliumQkvPlacement> metalium_qkv_parallel_placement(
+        size_t kind, const ggml_tensor * weight) {
+    const bool glimmer = weight != nullptr &&
+        ((kind == 0 && weight->ne[0] == 6656 && weight->ne[1] == 4096) ||
+         (kind != 0 && weight->ne[0] == 6656 && weight->ne[1] == 256));
+    const bool gqa_4096 = weight != nullptr &&
+        ((kind == 0 && weight->ne[0] == 4096 && weight->ne[1] == 4096) ||
+         (kind != 0 && weight->ne[0] == 4096 && weight->ne[1] == 1024));
+    if(!glimmer && !gqa_4096) return std::nullopt;
+
     std::vector<tt::tt_metal::CoreRange> ranges;
     size_t grid_x = 4;
     size_t grid_y = 1;
@@ -4725,6 +5600,11 @@ static MetaliumQkvPlacement metalium_qkv_parallel_placement(size_t kind) {
         grid_y = 4;
         per_core_n = 4;
         ranges.emplace_back(tt::tt_metal::CoreCoord(0, 0), tt::tt_metal::CoreCoord(7, 3));
+    } else if(gqa_4096) {
+        grid_x = 8;
+        per_core_n = 4;
+        const size_t y = kind == 1 ? 4 : 5;
+        ranges.emplace_back(tt::tt_metal::CoreCoord(0, y), tt::tt_metal::CoreCoord(7, y));
     } else if(kind == 1) {
         ranges.emplace_back(tt::tt_metal::CoreCoord(0, 6), tt::tt_metal::CoreCoord(3, 6));
     } else {
@@ -4749,29 +5629,74 @@ static MetaliumQkvPlacement metalium_qkv_parallel_placement(size_t kind) {
         .untilize_out = false,
         .allowed_worker_cores = workers,
     };
-    return { ttnn::operations::matmul::MatmulProgramConfig(std::move(config)), std::move(workers) };
+    return MetaliumQkvPlacement{
+        ttnn::operations::matmul::MatmulProgramConfig(std::move(config)), std::move(workers) };
 }
 
 static bool metalium_execute_qkv_parallel(ggml_backend_metalium_context * ctx, MetaliumQkvGroup & group) {
     GGML_UNUSED(ctx);
     group.executed = true;
+    const uint64_t logical_rows = (uint64_t)ggml_nrows(group.nodes[0]->src[1]);
+    if(logical_rows > 1) {
+        g_metalium_qkv_batched_attempt_count.fetch_add(1, std::memory_order_relaxed);
+    }
     try {
         std::array<std::shared_ptr<ttnn::Tensor>, 3> weights;
         for(size_t i = 0; i < weights.size(); i++) weights[i] = realize_ggml_view(group.nodes[i]->src[0]);
         auto input = realize_ggml_view(group.nodes[0]->src[1]);
         auto * mesh = dynamic_cast<ttnn::MeshDevice *>(input->device());
         if(mesh == nullptr) return false;
+
+
         std::array<ttnn::prim::MatmulParams, 3> attributes;
         std::array<ttnn::prim::MatmulInputs, 3> tensor_args;
         std::array<std::vector<ttnn::Tensor>, 3> outputs;
         std::vector<tt::tt_metal::ProgramDescriptor> descriptors;
         descriptors.reserve(3);
 
+        tt::tt_metal::distributed::MeshSocket * gate_recv_output = nullptr;
+        std::optional<ttnn::Tensor> remote_gate_input;
+        std::optional<ttnn::Tensor> remote_gate_out;
+        std::optional<ttnn::Tensor> local_gate_out;
+        if(group.gate_node != nullptr) {
+            auto gate_weight = realize_ggml_view(group.gate_node->src[0]);
+            auto * links = g_metalium_fabric_copy_links.get();
+            tt::tt_metal::distributed::MeshSocket * send_input = nullptr;
+            tt::tt_metal::distributed::MeshSocket * recv_input = nullptr;
+            tt::tt_metal::distributed::MeshSocket * send_output = nullptr;
+            if(input->device() == links->device0.get() && gate_weight->device() == links->device1.get()) {
+                send_input = links->send01.get();
+                recv_input = links->recv01.get();
+                send_output = links->send10.get();
+                gate_recv_output = links->recv10.get();
+            } else if(input->device() == links->device1.get() && gate_weight->device() == links->device0.get()) {
+                send_input = links->send10.get();
+                recv_input = links->recv10.get();
+                send_output = links->send01.get();
+                gate_recv_output = links->recv01.get();
+            }
+            GGML_ASSERT(send_input != nullptr && recv_input != nullptr &&
+                send_output != nullptr && gate_recv_output != nullptr);
+
+            remote_gate_input = ttnn::create_device_tensor(input->tensor_spec(), gate_weight->device());
+            ttnn::experimental::send_async(*input, *send_input);
+            ttnn::experimental::recv_async(*remote_gate_input, *recv_input);
+            auto * gate_meta = static_cast<ggml_tensor_extra_metalium *>(group.gate_node->extra);
+            remote_gate_out = ttnn::operations::matmul::matmul(
+                *remote_gate_input, *gate_weight, false,
+                !ggml_metalium_weight_kn(group.gate_node->src[0]), gate_meta->memory_config,
+                std::nullopt, ggml_metalium_q1_attn_program_config(group.gate_node->src[0], group.gate_node->src[1]),
+                std::nullopt, make_compute_kernel_config(remote_gate_input->device()));
+            local_gate_out = ttnn::create_device_tensor(remote_gate_out->tensor_spec(), input->device());
+            ttnn::experimental::send_async(*remote_gate_out, *send_output);
+        }
+
         for(size_t i = 0; i < weights.size(); i++) {
-            auto placement = metalium_qkv_parallel_placement(i);
+            auto placement = metalium_qkv_parallel_placement(i, group.nodes[i]->src[0]);
+            if(!placement.has_value()) return false;
             auto * meta = static_cast<ggml_tensor_extra_metalium *>(group.nodes[i]->extra);
             ttnn::prim::MatmulParams base;
-            base.program_config = placement.config;
+            base.program_config = placement->config;
             if(meta->memory_config.has_value()) base.output_mem_config = *meta->memory_config;
             base.compute_kernel_config = make_compute_kernel_config(input->device());
             base.transpose_a = false;
@@ -4781,7 +5706,7 @@ static bool metalium_execute_qkv_parallel(ggml_backend_metalium_context * ctx, M
             tensor_args[i].optional_input_tensors.emplace_back(std::nullopt);
             outputs[i] = ttnn::prim::MatmulDeviceOperation::create_output_tensors(attributes[i], tensor_args[i]);
             descriptors.push_back(ttnn::prim::MatmulMultiCoreReuseMcast1DProgramFactory::create_descriptor(
-                attributes[i], tensor_args[i], outputs[i], placement.cores));
+                attributes[i], tensor_args[i], outputs[i], placement->cores));
         }
 
         auto merged = tt::tt_metal::merge_program_descriptors(descriptors);
@@ -4794,10 +5719,21 @@ static bool metalium_execute_qkv_parallel(ggml_backend_metalium_context * ctx, M
             auto * meta = static_cast<ggml_tensor_extra_metalium *>(group.nodes[i]->extra);
             ggml_metalium_store_tensor(meta, std::move(outputs[i][0]));
         }
+        if(group.gate_node != nullptr) {
+            ttnn::experimental::recv_async(*local_gate_out, *gate_recv_output);
+            auto * gate_meta = static_cast<ggml_tensor_extra_metalium *>(group.gate_node->extra);
+            ggml_metalium_store_tensor(gate_meta, std::move(*local_gate_out));
+            g_metalium_fabric_copy_count.fetch_add(2, std::memory_order_relaxed);
+        }
+        if(logical_rows > 1) {
+            g_metalium_qkv_batched_fused_count.fetch_add(1, std::memory_order_relaxed);
+            g_metalium_qkv_batched_logical_rows.fetch_add(logical_rows, std::memory_order_relaxed);
+        }
         group.fused = true;
         return true;
     } catch(const std::exception & e) {
         fprintf(stderr, "Metalium parallel QKV fallback: %.200s\n", e.what());
+        if(group.gate_node != nullptr) throw;
         group.fused = false;
         return false;
     }
@@ -4811,6 +5747,7 @@ static bool metalium_execute_qkv_group(ggml_backend_metalium_context * ctx, Meta
 
 struct MetaliumFfnGroup {
     std::array<ggml_tensor *, 2> nodes{}; // gate, up
+    ggml_tensor * swiglu = nullptr;
     ggml_tensor * root = nullptr;
     bool executed = false;
 };
@@ -4828,9 +5765,18 @@ static int metalium_ffn_kind(const ggml_tensor * node) {
     return -1;
 }
 
+static bool metalium_ffn_swiglu_node(
+        const ggml_tensor * node,
+        const std::array<ggml_tensor *, 2> & ffn_nodes) {
+    return node != nullptr && node->op == GGML_OP_GLU &&
+        node->src[0] == ffn_nodes[0] && node->src[1] == ffn_nodes[1] &&
+        ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU && ggml_get_op_params_i32(node, 1) == 0;
+}
+
 static MetaliumFfnPlan metalium_build_ffn_plan(ggml_cgraph * cgraph) {
     MetaliumFfnPlan plan;
     static const bool enabled = getenv("GGML_METALIUM_INTERNAL_FFN_PARALLEL") != nullptr;
+    static const bool fuse_swiglu = getenv("GGML_METALIUM_INTERNAL_FFN_SWIGLU") != nullptr;
     if(!enabled || cgraph == nullptr || g_metalium_fabric_copy_links == nullptr) return plan;
 
     struct Pending {
@@ -4838,8 +5784,12 @@ static MetaliumFfnPlan metalium_build_ffn_plan(ggml_cgraph * cgraph) {
         std::array<int, 2> indices{ -1, -1 };
     };
     std::unordered_map<const ggml_tensor *, Pending> pending;
+    std::unordered_map<const ggml_tensor *, int> uses;
     for(int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+        for(int src = 0; src < GGML_MAX_SRC; ++src) {
+            if(node->src[src] != nullptr) uses[node->src[src]]++;
+        }
         const int kind = metalium_ffn_kind(node);
         if(kind < 0) continue;
         Pending & p = pending[node->src[1]];
@@ -4857,10 +5807,22 @@ static MetaliumFfnPlan metalium_build_ffn_plan(ggml_cgraph * cgraph) {
         MetaliumFfnGroup group;
         group.nodes = p.nodes;
         group.root = p.indices[0] <= p.indices[1] ? p.nodes[0] : p.nodes[1];
+        if(fuse_swiglu && !g_metalium_trace_enabled && uses[p.nodes[0]] == 1 && uses[p.nodes[1]] == 1 &&
+           (p.nodes[0]->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
+           (p.nodes[1]->flags & GGML_TENSOR_FLAG_OUTPUT) == 0) {
+            const int first_consumer = std::max(p.indices[0], p.indices[1]) + 1;
+            for(int i = first_consumer; i < cgraph->n_nodes; ++i) {
+                if(metalium_ffn_swiglu_node(cgraph->nodes[i], p.nodes)) {
+                    group.swiglu = cgraph->nodes[i];
+                    break;
+                }
+            }
+        }
         const size_t group_idx = plan.groups.size();
         plan.groups.push_back(group);
         plan.member[p.nodes[0]] = group_idx;
         plan.member[p.nodes[1]] = group_idx;
+        if(group.swiglu != nullptr) plan.member[group.swiglu] = group_idx;
     }
     return plan;
 }
@@ -4910,8 +5872,23 @@ static bool metalium_execute_ffn_parallel(ggml_backend_metalium_context * ctx, M
     ttnn::experimental::recv_async(local_up_out, *recv_output);
 
     g_metalium_fabric_copy_count.fetch_add(2, std::memory_order_relaxed);
-    ggml_metalium_store_tensor(gate_meta, std::move(gate_out));
-    ggml_metalium_store_tensor(up_meta, std::move(local_up_out));
+    if(group.swiglu != nullptr) {
+        using ttnn::operations::unary::EltwiseUnaryWithParam;
+        using ttnn::operations::unary::UnaryOpType;
+        const std::array<EltwiseUnaryWithParam, 1> lhs_silu{
+            EltwiseUnaryWithParam(UnaryOpType::SILU)};
+        auto * swiglu_meta = static_cast<ggml_tensor_extra_metalium *>(group.swiglu->extra);
+        GGML_ASSERT(swiglu_meta != nullptr);
+        auto swiglu_out = ttnn::multiply(
+            gate_out, local_up_out, std::nullopt, swiglu_meta->memory_config, std::nullopt,
+            /* post_activations = */ {}, lhs_silu, /* rhs_activations = */ {});
+        ggml_metalium_store_tensor(swiglu_meta, std::move(swiglu_out));
+        g_metalium_ffn_swiglu_count.fetch_add(1, std::memory_order_relaxed);
+        g_metalium_ffn_swiglu_rows.fetch_add((uint64_t)ggml_nrows(group.swiglu), std::memory_order_relaxed);
+    } else {
+        ggml_metalium_store_tensor(gate_meta, std::move(gate_out));
+        ggml_metalium_store_tensor(up_meta, std::move(local_up_out));
+    }
     return true;
 }
 
@@ -5705,6 +6682,11 @@ static void ggml_metalium_close_all_devices() {
         fprintf(stderr, "[metalium-fabric-copy] direct=%llu fallback=%llu\n",
             (unsigned long long)fabric_copies, (unsigned long long)fabric_fallbacks);
     }
+    ggml_metalium_report_qkv_batched_stats();
+    ggml_metalium_report_ffn_swiglu_stats();
+    ggml_metalium_report_kv_direct_write_stats();
+    ggml_metalium_report_kv_paged_attention_stats();
+    ggml_metalium_report_output_store_stats();
     // Close in reverse open order: submeshes before their parent. Each submesh shares the parent's
     // device scope, and tt-metal only runs DeviceManager::close_devices (which stops the fabric
     // routers and dispatch kernels) once the last holder of that scope has closed. Closing only

@@ -12,6 +12,8 @@ ggml_add_backend_library(ggml-metalium
     soft_max.cpp
     wkv7.cpp
     slice_write_folded.cpp
+    direct_kv_write.cpp
+    paged_q_align.cpp
     embedding.cpp
 )
 
@@ -89,6 +91,8 @@ if(GGML_METALIUM_EMBED_KERNELS)
             wkv7_decodeL_compute
             wkv7_writer
             slice_write_folded_dm
+            direct_kv_write_dm
+            paged_q_align_dm
             embedding_fold_reader
             embedding_fold_compute
             embedding_fold_writer

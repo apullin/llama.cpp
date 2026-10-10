@@ -69,6 +69,13 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // Optional sorted token candidates for every generated draft position.
+    // Implementations that expose distributions fill at most n_candidates IDs
+    // per position. Callers can use them to build a verifier tree while keeping
+    // the ordinary linear result unchanged.
+    std::vector<llama_tokens> * candidates = nullptr;
+    int32_t n_candidates = 0;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
@@ -78,6 +85,12 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
+
+// Process only the rows belonging to source_seq and commit their speculative
+// state to dest_seq. Used after verifier-tree traversal so unselected branches
+// do not duplicate draft-model feature/KV work.
+bool common_speculative_process_path(
+        common_speculative * spec, const llama_batch & batch, llama_seq_id source_seq, llama_seq_id dest_seq);
 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);

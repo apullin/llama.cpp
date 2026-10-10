@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -166,6 +167,10 @@ struct common_speculative_impl {
     virtual void begin(llama_seq_id seq_id, const llama_tokens & prompt) = 0;
 
     virtual bool process(const llama_batch & batch) = 0;
+
+    virtual bool process_path(const llama_batch & batch, llama_seq_id /*source_seq*/, llama_seq_id /*dest_seq*/) {
+        return process(batch);
+    }
 
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
@@ -1086,6 +1091,14 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 
     bool process(const llama_batch & batch_in) override {
+        return process_impl(batch_in, -1, -1);
+    }
+
+    bool process_path(const llama_batch & batch_in, llama_seq_id source_seq, llama_seq_id dest_seq) override {
+        return process_impl(batch_in, source_seq, dest_seq);
+    }
+
+    bool process_impl(const llama_batch & batch_in, llama_seq_id source_seq, llama_seq_id dest_seq) {
         if (batch_in.n_tokens <= 0) {
             return true;
         }
@@ -1102,18 +1115,30 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_tokens = batch_in.n_tokens;
 
-        // per-seq inclusive batch range (assumes each seq's tokens are contiguous in the batch)
-        std::vector<int32_t> i_batch_beg(n_seq, -1);
-        std::vector<int32_t> i_batch_end(n_seq, -1);
+        // A verifier tree can attach one input row to several sequence IDs and
+        // interleave branch-only rows. Record the exact source rows for each
+        // sequence instead of assuming one contiguous, single-sequence range.
+        std::vector<std::vector<int32_t>> i_batch_rows(n_seq);
         for (int32_t k = 0; k < n_tokens; ++k) {
-            GGML_ASSERT(batch_in.n_seq_id[k] == 1);
-            const llama_seq_id seq_id = batch_in.seq_id[k][0];
-            if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            if (source_seq >= 0) {
+                if (dest_seq < 0 || dest_seq >= (llama_seq_id) n_seq) {
+                    return false;
+                }
+                for (int32_t j = 0; j < batch_in.n_seq_id[k]; ++j) {
+                    if (batch_in.seq_id[k][j] == source_seq) {
+                        i_batch_rows[dest_seq].push_back(k);
+                        break;
+                    }
+                }
                 continue;
             }
-            i_batch_end[seq_id] = k;
-            if (i_batch_beg[seq_id] < 0) {
-                i_batch_beg[seq_id] = k;
+
+            for (int32_t j = 0; j < batch_in.n_seq_id[k]; ++j) {
+                const llama_seq_id seq_id = batch_in.seq_id[k][j];
+                if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+                    continue;
+                }
+                i_batch_rows[seq_id].push_back(k);
             }
         }
 
@@ -1123,14 +1148,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            if (i_batch_beg[seq_id] < 0) {
+            const auto & rows = i_batch_rows[seq_id];
+            if (rows.empty()) {
                 continue;
             }
-            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            const int32_t n_rows = (int32_t) rows.size();
 
             // an M-RoPE image pins all its rows to one position, so a windowed draft
             // cache cannot free cells for it - skip it, the draft can jump over the gap
-            const bool pos_pinned = batch_in.pos[i_batch_beg[seq_id]] == batch_in.pos[i_batch_end[seq_id]];
+            const bool pos_pinned = batch_in.pos[rows.front()] == batch_in.pos[rows.back()];
             if (has_embeddings && n_rows > 1 && pos_pinned) {
                 continue;
             }
@@ -1147,14 +1173,16 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
                     }
                     for (int32_t i = 0; i < n_chunk; ++i) {
+                        const int32_t i_batch = rows[offset + i];
                         float       * dst = batch_inject.embd + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
+                        const float * src = layer + (size_t) i_batch * n_embd_tgt;
                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
                     }
                 }
 
                 for (int32_t i = 0; i < n_chunk; ++i) {
-                    const llama_pos p = batch_in.pos[i_batch_beg[seq_id] + offset + i];
+                    const int32_t i_batch = rows[offset + i];
+                    const llama_pos p = batch_in.pos[i_batch];
                     batch_inject.pos[i] = p;
                     if (is_mrope) {
                         batch_inject.pos[1 * n_chunk + i] = p;
@@ -1194,6 +1222,9 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
 
             common_sampler_reset(smpls[seq_id].get());
+            if (dp.candidates != nullptr) {
+                dp.candidates->clear();
+            }
 
             const int32_t n = (int32_t) dp.pos0;
 
@@ -1285,6 +1316,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     const llama_token id = cur_p->data[0].id;
 
+                    if (dp.candidates != nullptr && dp.n_candidates > 0) {
+                        auto & candidates = *dp.candidates;
+                        candidates.emplace_back();
+                        auto & ids = candidates.back();
+                        const int32_t n = std::min(dp.n_candidates, (int32_t) cur_p->size);
+                        ids.reserve(n);
+                        for (int32_t k = 0; k < n; ++k) {
+                            ids.push_back(cur_p->data[k].id);
+                        }
+                    }
+
                     common_sampler_accept(smpl, id, true);
 
                     result.push_back(id);
@@ -1306,6 +1348,17 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     if (cur_p->data[0].p < params.p_min) {
                         break;
+                    }
+
+                    if (dp.candidates != nullptr && dp.n_candidates > 0) {
+                        auto & candidates = *dp.candidates;
+                        candidates.emplace_back();
+                        auto & ids = candidates.back();
+                        const int32_t n = std::min(dp.n_candidates, (int32_t) cur_p->size);
+                        ids.reserve(n);
+                        for (int32_t k = 0; k < n; ++k) {
+                            ids.push_back(cur_p->data[k].id);
+                        }
                     }
 
                     common_sampler_accept(smpl, id, true);
@@ -2799,6 +2852,22 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
         result = result && impl->process(batch);
     }
 
+    return result;
+}
+
+bool common_speculative_process_path(
+        common_speculative * spec,
+        const llama_batch & batch,
+        llama_seq_id source_seq,
+        llama_seq_id dest_seq) {
+    bool result = true;
+    if (spec == nullptr) {
+        return result;
+    }
+
+    for (auto & impl : spec->impls) {
+        result = result && impl->process_path(batch, source_seq, dest_seq);
+    }
     return result;
 }
 

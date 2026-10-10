@@ -1,0 +1,26 @@
+- mesh_device_created:
+    mesh_id: 0
+    timestamp_ns: 1790651953274654554
+    devices: [0, 1]
+    shape: [2, 1]
+- mesh_device_initialized:
+    mesh_id: 0
+    timestamp_ns: 1790651953275821958
+- mesh_device_created:
+    mesh_id: 1
+    timestamp_ns: 1790651953325236086
+    parent_mesh_id: 0
+    devices: [0]
+    shape: [1, 1]
+- mesh_device_initialized:
+    mesh_id: 1
+    timestamp_ns: 1790651953326179394
+- mesh_device_created:
+    mesh_id: 2
+    timestamp_ns: 1790651953331518949
+    parent_mesh_id: 0
+    devices: [1]
+    shape: [1, 1]
+- mesh_device_initialized:
+    mesh_id: 2
+    timestamp_ns: 1790651953332592052
